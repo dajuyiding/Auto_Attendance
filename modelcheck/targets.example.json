@@ -1,0 +1,39 @@
+{
+  "_说明": [
+    "把这份复制成 targets.json，填上你自己的端点，然后：",
+    "  python3 modelcheck.py --targets targets.json --out runs/latest --jobs 4",
+    "api_key 支持 'env:环境变量名' 的写法，避免把密钥写进文件。",
+    "关键：要对比的端点，model 字段请写成一模一样的字符串，",
+    "      否则 tokenizer 指纹的交叉比对不会触发。"
+  ],
+  "targets": [
+    {
+      "name": "基准·官方直连 gpt-4o",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "env:OPENAI_API_KEY",
+      "model": "gpt-4o",
+      "note": "你确信没问题的基准，用来当对照"
+    },
+    {
+      "name": "待测·某中转 gpt-4o",
+      "base_url": "https://relay.example.com/v1",
+      "api_key": "env:RELAY_API_KEY",
+      "model": "gpt-4o",
+      "note": "model 写成一模一样的 gpt-4o，才能比对 tokenizer 指纹"
+    },
+    {
+      "name": "标定·本地 4bit 量化（已知被量化）",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "api_key": "",
+      "model": "Qwen/Qwen3-32B-AWQ",
+      "note": "自己跑的 AWQ 4bit，用来标定「被量化」应该长什么样"
+    },
+    {
+      "name": "对照·本地 FP16 同模型",
+      "base_url": "http://127.0.0.1:8001/v1",
+      "api_key": "",
+      "model": "Qwen/Qwen3-32B",
+      "note": "和上面同一个模型的非量化版本，两者差距就是量化造成的损失"
+    }
+  ]
+}

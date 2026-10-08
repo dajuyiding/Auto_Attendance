@@ -550,8 +550,9 @@ def score_svg(a: SvgAnalysis) -> dict:
 
     # 1) 是不是一份能用的 SVG
     if not a.ok:
-        _mk(crit, "valid_svg", "SVG 合法性", 0.0, 0.10, a.reason)
-    elif not (a.has_viewbox or a.has_width_height):
+        _mk(crit, "valid_svg", "SVG 合法性", 0.0, 1.0, a.reason)
+        return _finish(crit)
+    if not (a.has_viewbox or a.has_width_height):
         _mk(crit, "valid_svg", "SVG 合法性", 0.6, 0.10,
             "有 <svg> 但既无 viewBox 也无 width/height，尺寸未定义")
     elif not a.xml_valid:
@@ -2146,7 +2147,12 @@ def start_mock_gateway(quality: str = "good", prec: str = "bf16"):
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
-    return f"http://127.0.0.1:{srv.server_address[1]}/v1", srv.shutdown
+
+    def shutdown():
+        srv.shutdown()
+        srv.server_close()
+
+    return f"http://127.0.0.1:{srv.server_address[1]}/v1", shutdown
 
 
 # --------------------------------------------------------------------------
