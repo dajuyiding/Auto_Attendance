@@ -26,9 +26,77 @@
 Generate an SVG of a pelican riding a bicycle
 ```
 
+**只能通过别的 agent 或网页访问模型？** 看下一节的三种情况——第三类有专门的离线模式。
+
 ---
 
-## 二、鹈鹕测试：为什么它这么有效
+## 二、怎么落地：模型在别的 agent / 网页里怎么办
+
+这是最容易卡住的地方。先分清三类，**只有第三类需要「手动模式」**：
+
+### 情况 A：你手上有 API key（推荐，也是唯一能真正测量化的）
+
+只要能拿到 `base_url` + key，**agent 是什么都无所谓**——模型不在 agent 里，agent 只是个壳。
+把 key 填进 `targets.json` 就能直接跑：
+
+- 各家官方直连（OpenAI / Anthropic / Google / DeepSeek / 智谱 / Moonshot …）
+- 中转站、聚合站（OpenRouter、自建 one-api / new-api 等，基本都提供 OpenAI 兼容接口）
+- 你正在用的 agent 如果能配自定义 base_url（Cline、Roo、Cursor、Continue、
+  Open WebUI、LibreChat…），说明它背后本来就是个 API，**把那个 key 直接拿过来用**即可，
+  不用管 agent 的界面。
+
+### 情况 B：本地跑的模型（测量化最靠谱）
+
+Ollama / LM Studio / llama.cpp / vLLM 都自带 OpenAI 兼容端点，直接当端点配：
+
+```bash
+ollama serve          # 默认 http://127.0.0.1:11434/v1
+```
+
+这是**唯一能自己控制量化等级**的场景：同一个模型分别拉 `q8_0` / `q4_K_M` / `fp16`，
+同批跑一遍，你就能亲眼看到「4-bit 到底掉了多少分」。顺便也就标定了 L1/L2 分数的量级——
+这比看论文里的数字有用得多，因为你能得到**自己工作负载下**的差距。
+
+### 情况 C：只有网页/对话框，没有 API
+
+用离线模式。**评分逻辑和在线完全一样**，只是题目靠人工搬运：
+
+```bash
+# 1) 导出题目清单（不调用任何 API）
+python3 modelcheck.py --emit-prompts prompts/
+
+# 2) 按 prompts/PROMPTS.md 把每道题原文发给模型，
+#    回答原样存成 answers/<模型别名>/<题目id>.txt|.svg|.html
+#    （连 markdown 围栏一起存没关系，会自动抠代码）
+
+# 3) 出报告，和在线模式同样的 report.md / gallery.html
+python3 modelcheck.py --import-dir answers/ --out runs/manual
+```
+
+目录长这样，也支持平铺写法 `answers/<模型别名>__<题目id>.txt`：
+
+```
+answers/
+  某个网页版模型/
+    pelican_svg.svg
+    arith_mul.txt
+    instruction_exact/        # 需要重复的题，放多个文件看一致性
+      1.txt
+      2.txt
+      3.txt
+```
+
+> ⚠️ **离线模式的边界**：拿不到 `logprobs`，所以 **4.1 / 4.2 / 4.3 / 4.4 全部失效**，
+> 只剩 L1 视觉 + L2 能力。也就是说——**离线模式能比出「差距」和「哪些能力崩了」，
+> 但不能直接断定「被量化了」。** 真想测量化，尽量走情况 A 或 B。
+
+> ⚠️ 离线模式还有个坑：网页/对话框会自作主张（带记忆、自动改格式、拒绝回答）。
+> 每道题**务必开新对话、不要给上下文**，否则「精确指令遵循」「严格 JSON」
+> 这类题测的就不是模型，而是你的对话框了。
+
+---
+
+
 
 这个测试由 [Simon Willison 在 2024-10 提出](https://simonwillison.net/2024/Oct/25/pelicans-on-a-bicycle/)，
 后来形成了社区作品集 [pelicanbenchmark.com](https://pelicanbenchmark.com/)。
@@ -57,7 +125,7 @@ Generate an SVG of a pelican riding a bicycle
 
 ---
 
-## 三、怎么判断「是不是被量化过」——可测信号清单
+## 四、怎么判断「是不是被量化过」——可测信号清单
 
 先记住量化的量级（这样才知道自己在找多大的差异）：
 
@@ -80,7 +148,7 @@ KLD（KL 散度，衡量「用量化模型替代原模型的额外困惑」，�
 
 你没法在所有供应商上算 KLD（需要参考模型的完整分布），但可以**用它的精神做黑盒近似**：
 
-### 3.1 分布糊度（需要 `logprobs`，最好用）
+### 4.1 分布糊度（需要 `logprobs`，最好用）
 
 在**答案几乎唯一**的提示词上（`2 + 2 =`、`The capital of France is`、`7 times 8 equals` …）
 只要 1 个 token 的输出，看首 token 的分布：
@@ -90,7 +158,7 @@ KLD（KL 散度，衡量「用量化模型替代原模型的额外困惑」，�
 - **答对率**：更极端的量化会直接答错。这个指标最好用，因为它不依赖任何参考模型。
 
 
-### 3.2 logit 浮点精度反推（本工具已实现，最有意思的一条）
+### 4.2 logit 浮点精度反推（本工具已实现，最有意思的一条）
 
 出处：ICLR Blogposts 2026
 [*Extracting Model Precision from 20 Logprobs*](https://iclr-blogposts.github.io/2026/blog/2026/precision-extraction/)。
@@ -112,7 +180,7 @@ KLD（KL 散度，衡量「用量化模型替代原模型的额外困惑」，�
 只有明显粗于同批其他端点（尤其 FP8）才值得警惕。而且这个方法**只能看 logits 的精度**，
 对 int4/int8 这类非标准格式会直接回落成 FP32，属于已知盲区。
 
-### 3.3 tokenizer 指纹（抓「换模型」最硬）
+### 4.3 tokenizer 指纹（抓「换模型」最硬）
 
 固定几个字符串（英文、中文、代码、纯数字），看 `usage.prompt_tokens`。
 
@@ -120,7 +188,7 @@ KLD（KL 散度，衡量「用量化模型替代原模型的额外困惑」，�
 
 对不上，就说明底层 tokenizer 不同 —— 那不是「同一个模型的量化版」，而是**另一个模型**。
 
-### 3.4 漂移基线（抓「同一个端点悄悄变差」）
+### 4.4 漂移基线（抓「同一个端点悄悄变差」）
 
 出处：arXiv:2512.03816
 [*Log Probability Tracking of LLM APIs*](https://arxiv.org/abs/2512.03816)。
@@ -130,7 +198,7 @@ KLD（KL 散度，衡量「用量化模型替代原模型的额外困惑」，�
 
 供应商说「我们换了个更快的推理后端」时，这是唯一能验证的说法。
 
-### 3.5 最先崩的能力（不需要 logprobs 也能用）
+### 4.5 最先崩的能力（不需要 logprobs 也能用）
 
 量化/小模型在这些任务上**掉得最快**，因为它们是纯符号通路，几乎没有「语义兜底」：
 
@@ -145,7 +213,7 @@ KLD（KL 散度，衡量「用量化模型替代原模型的额外困惑」，�
 
 ---
 
-## 四、怎么横向对比出差距
+## 五、怎么横向对比出差距
 
 这是整套方法的关键，**不做这一步，上面的分数都没有意义**：
 
@@ -161,7 +229,7 @@ KLD（KL 散度，衡量「用量化模型替代原模型的额外困惑」，�
 
 ---
 
-## 五、用法
+## 六、用法
 
 ```bash
 # 1) 不需要任何 API key，先跑自检，确认工具本身没问题
@@ -177,7 +245,11 @@ python3 modelcheck.py --targets targets.json --out runs/2026-10-08 --jobs 4
 # 4) 只跑视觉层（最便宜的体检）
 python3 modelcheck.py --targets targets.json --only visual --out runs/visual
 
-# 5) 存基线 / 复测漂移
+# 5) 没有 API、只能在网页/agent 里用？走离线模式（见第二节情况 C）
+python3 modelcheck.py --emit-prompts prompts/          # 导出题目
+python3 modelcheck.py --import-dir answers/ --out runs/manual   # 导入作答
+
+# 6) 存基线 / 复测漂移
 python3 modelcheck.py --targets targets.json --out runs/today --save-baseline baseline.json
 python3 modelcheck.py --targets targets.json --out runs/next  --baseline baseline.json
 ```
@@ -198,7 +270,7 @@ python3 modelcheck.py --targets targets.json --out runs/next  --baseline baselin
 
 ---
 
-## 六、报告里每条判定是什么意思
+## 七、报告里每条判定是什么意思
 
 | 信号 | 含义 | 怎么处理 |
 |---|---|---|
@@ -211,7 +283,7 @@ python3 modelcheck.py --targets targets.json --out runs/next  --baseline baselin
 
 ---
 
-## 七、这些方法**做不到**什么（请务必读）
+## 八、这些方法**做不到**什么（请务必读）
 
 - **一次结果不能代表模型。** 采样有随机性，供应商后端也在变。同一个模型不同时间、
   不同温度、不同系统提示词，结果可能差很多。
@@ -219,18 +291,20 @@ python3 modelcheck.py --targets targets.json --out runs/next  --baseline baselin
   它会误判（比如把眼睛当成头、把独轮车当成缺一个轮子）。**看图仍是最终裁判**，
   自动分只是帮你排序和抓明显缺件。
 - **量化检测有盲区。** int4/int8 等非标准格式会让精度反推回落成 FP32；
-  端点不支持 `logprobs` 时 3.1 / 3.2 / 3.4 全部失效（只剩 3.3 和 3.5）。
+  端点不支持 `logprobs` 时 4.1 / 4.2 / 4.4 全部失效（只剩 4.3 和 4.5）。
   而且**给 logprob 加随机噪声就能完全防住精度反推**——这是论文自己承认的，
   所以「没检测出来」不等于「没被量化」。
 - **精度碰撞。** 更低精度的格点是更高精度格点的子集，所以粗格式能被细数据「假装」匹配。
   本工具取尾数位最少的匹配，并给出 `all_matching` 让你看到所有可能。
 - **不能证明供应商身份。** 这套东西测的是「能力和一致性」，不是密码学意义上的认证。
+- **离线模式测不出量化。** 只能通过网页/对话框访问时拿不到 `logprobs`，L3 整套失效
+  （见第二节情况 C）——它只能告诉你「哪个更差」，不能告诉你「为什么差」。
 - **它不替代正式评测。** MMLU / HumanEval / LiveBench 这类基准仍然是下结论的主力；
   这套探针的价值在于**便宜、直观、能定期跑**，适合做日常体检和排查。
 
 ---
 
-## 八、自检覆盖了什么
+## 九、自检覆盖了什么
 
 `--selftest` 会跑完整条流水线（不需要任何 API key）：
 
@@ -239,5 +313,9 @@ python3 modelcheck.py --targets targets.json --out runs/next  --baseline baselin
 2. **logit 精度反推**对 5 种合成格式是否 5/5 命中，且在随机 FP32 数据上 0 误报；
 3. **每个确定性检查器**的正反用例；
 4. **端到端**：起两个本地 mock 网关（一个正常 BF16、一个「被量化」成 FP8 且能力下降），
-   跑完整套探针 + 报告 + 画廊，验证会话正确标出可疑的那个。
+   跑完整套探针 + 报告 + 画廊，验证会自动标出可疑的那个；
+5. **离线模式**：导出题目 → 按约定摆放作答 → 导入出报告，验证中文模型名不串数据、
+   未提交的题被正确剔除、重复提交能算一致性、复制粘贴多出来的引号能被容错。
+
+> 共 46 项测试，跑 `python3 -m unittest test_modelcheck` 或 `python3 modelcheck.py --selftest`。
 

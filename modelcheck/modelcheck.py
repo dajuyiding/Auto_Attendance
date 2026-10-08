@@ -44,6 +44,7 @@ import argparse
 import concurrent.futures
 import dataclasses
 import datetime as _dt
+import hashlib
 import json
 import math
 import os
@@ -79,8 +80,12 @@ class Target:
 
     @property
     def slug(self) -> str:
-        s = re.sub(r"[^A-Za-z0-9._-]+", "-", self.name).strip("-")
-        return s or "target"
+        # 保留 Unicode 词字符（中文名也能成为可读的目录名），
+        # 全部被过滤掉时退化成稳定哈希，避免不同目标撞成同一个 slug 而串数据。
+        s = re.sub(r"[^\w.-]+", "-", self.name or "", flags=re.UNICODE).strip("-")
+        if not s:
+            s = "t-" + hashlib.md5((self.name or "").encode("utf-8")).hexdigest()[:8]
+        return s
 
     def url(self, path: str = "/chat/completions") -> str:
         return self.base_url.rstrip("/") + path
@@ -1051,13 +1056,26 @@ def check_json(text: str, params: dict, res: CallResult):
     if fenced:
         m = re.search(r"```[a-zA-Z]*\s*\n([\s\S]*?)```", t)
         body = m.group(1).strip() if m else t
+    def check_json_tolerant(text):
+        """容忍「复制粘贴时多包了一层引号」这种常见情况。"""
+        t = (text or "").strip()
+        if len(t) >= 2 and t[0] == '"' and t[-1] == '"':
+            t2 = t[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+            try:
+                return json.loads(t2), True
+            except Exception:
+                pass
+        return json.loads(t), False
+
     try:
-        obj = json.loads(body)
+        obj, unquoted = check_json_tolerant(body)
     except Exception as e:
         return 0.0, f"不是合法 JSON：{e}"
     if not isinstance(obj, dict):
         return 0.2, f"顶层不是对象，而是 {type(obj).__name__}"
     score, notes = 1.0, []
+    if unquoted:
+        notes.append("外层多包了一层引号（粘贴常见，已自动容错）")
     if fenced:
         score -= 0.3
         notes.append("套了 markdown 围栏（严格模式下算失败）")
@@ -1522,38 +1540,32 @@ def _svg_summary(a: SvgAnalysis) -> dict:
     }
 
 
-def run_probe(target: Target, probe: Probe, exec_code: bool = True) -> ProbeRun:
-    """跑一个探针。runs>1 时会重复跑并给出「一致性」分。"""
-    run = ProbeRun(probe_id=probe.id, group=probe.group, kind=probe.kind,
-                   desc=probe.desc, weight=probe.weight)
+def _new_run(probe: Probe) -> ProbeRun:
+    return ProbeRun(probe_id=probe.id, group=probe.group, kind=probe.kind,
+                    desc=probe.desc, weight=probe.weight)
 
-    messages = []
-    if probe.system:
-        messages.append({"role": "system", "content": probe.system})
-    messages.append({"role": "user", "content": probe.prompt})
 
-    n = max(1, probe.runs)
-    results, texts = [], []
-    for _ in range(n):
-        r = call_chat(target, messages, max_tokens=probe.max_tokens,
-                      temperature=probe.temperature, want_logprobs=probe.needs_logprobs)
-        results.append(r)
-        if r.ok:
-            texts.append(r.text or "")
-        run.latency_ms = max(run.latency_ms, r.latency_ms)
+def score_answers(probe: Probe, texts: list, exec_code: bool = True,
+                  finish_reason: str = "stop") -> ProbeRun:
+    """把一批「回答原文」按探针规则打分。**不涉及任何网络调用。**
 
-    good = [r for r in results if r.ok]
-    if not good:
+    在线模式喂 API 返回；离线模式喂人工从 agent 对话框 / 网页里收集来的回答。
+    两条路走的是完全一样的评分和报告逻辑——这样即使模型只能通过别的 agent
+    或网页访问，你也能得到同样的结论。
+    """
+    run = _new_run(probe)
+    texts = [t for t in (texts or []) if t is not None]
+    if not texts:
         run.ok = False
-        run.error = (results[0].error if results else "没有结果")[:300]
+        run.error = "没有拿到任何回答"
         run.detail = "调用失败"
         return run
 
     run.ok = True
-    run.finish_reason = good[0].finish_reason
-    run.text = good[0].text or ""
+    run.finish_reason = finish_reason
+    run.text = texts[0]
     if len(texts) >= 2:
-        # 一致性：多数投票占比
+        # 一致性：多数投票占比（在线时是重复调用，离线时是同一题提交多次）
         modal = max(set(texts), key=texts.count)
         run.consistency = round(texts.count(modal) / len(texts), 3)
 
@@ -1562,7 +1574,8 @@ def run_probe(target: Target, probe: Probe, exec_code: bool = True) -> ProbeRun:
         run.code = extract_code(run.text)
         if probe.kind == "svg":
             a = analyze_svg(run.code)
-            scorer = score_svg_generic if probe.params.get("scorer") == "generic" else score_svg
+            scorer = (score_svg_generic if probe.params.get("scorer") == "generic"
+                      else score_svg)
             s = scorer(a)
             run.analysis = _svg_summary(a)
             run.criteria = s["criteria"]
@@ -1588,11 +1601,13 @@ def run_probe(target: Target, probe: Probe, exec_code: bool = True) -> ProbeRun:
             run.score, run.detail = 0.0, f"未知检查器 {probe.checker}"
             return run
         if probe.checker == "python" and not exec_code:
-            run.score, run.detail = 0.0, "已用 --no-exec 禁用代码执行"
+            run.scored = False
+            run.score, run.detail = 0.0, "已用 --no-exec 禁用代码执行（仅记录）"
             return run
         scores, details = [], []
-        for r in good:
-            sc, dt = fn(r.text, probe.params, r)
+        for t in texts:
+            sc, dt = fn(t, probe.params, CallResult(ok=True, text=t,
+                                                    finish_reason=finish_reason))
             scores.append(sc)
             details.append(dt)
         run.score = sum(scores) / len(scores)
@@ -1604,7 +1619,34 @@ def run_probe(target: Target, probe: Probe, exec_code: bool = True) -> ProbeRun:
     # 只记录不判分的探针
     run.scored = False
     run.score = 0.0
-    run.detail = run.text.strip()[:200]
+    run.detail = (run.text or "").strip()[:200]
+    return run
+
+
+def run_probe(target: Target, probe: Probe, exec_code: bool = True) -> ProbeRun:
+    """在线模式：调用 API 再走 score_answers。runs>1 时会重复调用看一致性。"""
+    messages = []
+    if probe.system:
+        messages.append({"role": "system", "content": probe.system})
+    messages.append({"role": "user", "content": probe.prompt})
+
+    results = []
+    for _ in range(max(1, probe.runs)):
+        results.append(call_chat(target, messages, max_tokens=probe.max_tokens,
+                                 temperature=probe.temperature,
+                                 want_logprobs=probe.needs_logprobs))
+
+    good = [r for r in results if r.ok]
+    if not good:
+        run = _new_run(probe)
+        run.ok = False
+        run.error = (results[0].error if results else "没有结果")[:300]
+        run.detail = "调用失败"
+        return run
+
+    run = score_answers(probe, [r.text or "" for r in good], exec_code=exec_code,
+                        finish_reason=good[0].finish_reason)
+    run.latency_ms = max((r.latency_ms for r in results), default=0)
     return run
 
 
@@ -1710,6 +1752,7 @@ def analyze_fleet(results: list, gap: float = 0.18) -> list:
             "tokenizer": (fp.get("tokenizer") or {}).get("fingerprint"),
             "deterministic": (fp.get("protocol") or {}).get("deterministic"),
             "model_echo": (fp.get("protocol") or {}).get("model_echo"),
+            "offline": not fp,
             "flags": [],
         })
 
@@ -1753,6 +1796,10 @@ def analyze_fleet(results: list, gap: float = 0.18) -> list:
         if r["deterministic"] is False:
             f.append({"sev": "info", "kind": "nondeterministic",
                       "msg": "温度 0 下三次结果不一致（网关缓存/路由或采样参数被改写）"})
+        if r.get("offline"):
+            f.append({"sev": "info", "kind": "no_fingerprint",
+                      "msg": "离线模式（人工收集），拿不到 logprobs，"
+                             "L3 量化检测不可用，只能看 L1/L2 的相对差距"})
 
     # tokenizer 交叉比对：同 model 字段但指纹不同 = 换模型
     by_model = {}
@@ -2216,6 +2263,164 @@ def compare_baseline(results: list, baseline: dict, tol: float = 0.05) -> list:
 # CLI
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# 离线模式：模型在别的 agent / 网页里，没有 API 时怎么办
+# --------------------------------------------------------------------------
+
+_EXT_FOR = {"svg": ".svg", "html": ".html", "text": ".txt"}
+
+
+def emit_prompts(outdir: str, probes: list, log=lambda *_a: None) -> str:
+    """把探针题目导出成「可直接粘贴」的清单，供任何 agent / 网页对话框使用。
+
+    生成：
+      <outdir>/PROMPTS.md          人看的清单 + 保存说明
+      <outdir>/prompts.json        机器可读（想写脚本自动投喂 agent 用这个）
+      <outdir>/prompts/<id>.txt    每题一个文件，内容就是原文，复制即用
+    """
+    pdir = os.path.join(outdir, "prompts")
+    os.makedirs(pdir, exist_ok=True)
+
+    lines = ["# modelcheck 离线题目清单", "",
+             "模型只能通过别的 agent 或网页访问时，用这个模式：", "",
+             "1. 把下面每道题**原文**发给模型（一题一个全新对话，别带上下文，" +
+             "否则「精确指令遵循」这类题就不准了）。",
+             "2. 把模型的回答**原样**存成文件（连 markdown 围栏一起存也没关系，会自动抠代码）。",
+             "3. 目录按下面的约定放，然后跑：",
+             "",
+             "```bash",
+             "python3 modelcheck.py --import-dir answers/ --out runs/manual",
+             "```",
+             "",
+             "## 目录约定",
+             "",
+             "```",
+             "answers/",
+             "  <模型别名>/",
+             "    pelican_svg.svg            # 图形类：存模型给的整段回答也行",
+             "    pelican_animated.html",
+             "    arith_mul.txt",
+             "    instruction_exact/          # 需要重复的题，放多个文件看一致性",
+             "      1.txt",
+             "      2.txt",
+             "      3.txt",
+             "```",
+             "",
+             "也支持平铺写法：`answers/<模型别名>__<题目id>.txt`。",
+             "",
+             "> ⚠️ 离线模式拿不到 `logprobs`，所以 L3 的「分布糊度 / logit 精度反推 / " +
+             "tokenizer 指纹 / 漂移基线」全部不可用，只剩 L1 视觉 + L2 能力。" +
+             "想测量化，优先用下面「情况 A/B」拿 API。",
+             "",
+             "---", ""]
+
+    for p in probes:
+        body = p.prompt
+        fn = os.path.join(pdir, p.id + ".txt")
+        with open(fn, "w", encoding="utf-8") as f:
+            f.write(body)
+        times = f"　（这题建议独立跑 {p.runs} 次，看一致性）" if p.runs > 1 else ""
+        lines.append(f"## {p.id}　`{p.group}`{times}")
+        lines.append("")
+        lines.append(f"*{p.desc}*")
+        lines.append("")
+        lines.append("要保存成：`<模型别名>/" + p.id + _EXT_FOR.get(p.kind, ".txt") + "`"
+                     if p.runs <= 1 else
+                     "要保存成：`<模型别名>/" + p.id + "/1.txt`（依次 2、3…）")
+        lines.append("")
+        lines.append("```text")
+        lines.append(body if len(body) < 1200 else body[:1200] + "\n...(见 prompts/" + p.id + ".txt)")
+        lines.append("```")
+        lines.append("")
+
+    md = os.path.join(outdir, "PROMPTS.md")
+    with open(md, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    with open(os.path.join(outdir, "prompts.json"), "w", encoding="utf-8") as f:
+        json.dump([{"id": p.id, "group": p.group, "kind": p.kind, "runs": p.runs,
+                    "desc": p.desc, "prompt": p.prompt,
+                    "save_as": p.id + _EXT_FOR.get(p.kind, ".txt")} for p in probes],
+                  f, ensure_ascii=False, indent=2)
+    log(f"已导出 {len(probes)} 道题 -> {md}")
+    return md
+
+
+def _read_any(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def load_manual_answers(dirpath: str, probes: list, exec_code: bool = True,
+                        log=lambda *_a: None) -> list:
+    """从人工收集的回答目录生成结果（不联网），产出与在线模式完全同构。"""
+    if not os.path.isdir(dirpath):
+        raise SystemExit(f"--import-dir 不是目录：{dirpath}")
+
+    by_id = {p.id: p for p in probes}
+    # 1) 收集 <target>/<probe>... ，同时支持平铺的 <target>__<probe>
+    collected: dict = {}
+    for entry in sorted(os.listdir(dirpath)):
+        full = os.path.join(dirpath, entry)
+        if os.path.isdir(full):
+            target = entry
+            for sub in sorted(os.listdir(full)):
+                subfull = os.path.join(full, sub)
+                stem = os.path.splitext(sub)[0]
+                if os.path.isdir(subfull):
+                    if sub in by_id:
+                        texts = [_read_any(os.path.join(subfull, x))
+                                 for x in sorted(os.listdir(subfull))]
+                        collected.setdefault(target, {})[sub] = texts
+                elif stem in by_id:
+                    collected.setdefault(target, {})[stem] = [_read_any(subfull)]
+        elif os.path.isfile(full):
+            stem = os.path.splitext(entry)[0]
+            if "__" in stem:
+                target, _, pid = stem.partition("__")
+                if pid in by_id:
+                    collected.setdefault(target, {})[pid] = [_read_any(full)]
+
+    if not collected:
+        raise SystemExit(
+            f"在 {dirpath} 里没找到任何符合约定的回答文件。\n"
+            "期望结构：answers/<模型别名>/<题目id>.txt|.svg|.html\n"
+            "先跑 python3 modelcheck.py --emit-prompts prompts/ 看题目清单。")
+
+    results = []
+    used_slugs = {}
+    for target, answers in sorted(collected.items()):
+        runs = []
+        for p in probes:
+            texts = answers.get(p.id)
+            if texts:
+                run = score_answers(p, texts, exec_code=exec_code)
+            else:
+                run = _new_run(p)
+                run.ok = False
+                run.error = "未提交回答"
+                run.detail = "未提交回答（跳过）"
+            runs.append(dataclasses.asdict(run))
+        got = sum(1 for r in runs if r["ok"])
+        log(f"  [{target}] 收到 {got}/{len(probes)} 题的作答")
+        slug = Target(name=target, base_url="manual").slug
+        used_slugs[slug] = used_slugs.get(slug, 0) + 1
+        if used_slugs[slug] > 1:
+            slug = f"{slug}-{used_slugs[slug]}"     # 防撞：不同目标不能共用一个 slug
+        results.append({
+            "target": {"name": target, "model": target, "base_url": "(人工收集)",
+                       "api_key": "", "note": "离线模式：无 logprobs", "extra_body": {},
+                       "headers": {}},
+            "slug": slug,
+            "runs": runs,
+            "fingerprint": {},          # 离线模式没有 L3
+        })
+    return results
+
+
+
 def load_targets(path: str) -> list:
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
@@ -2352,6 +2557,22 @@ def selftest() -> int:
     return 0 if ok else 1
 
 
+def _print_summary(rows: list):
+    """打印总览表 + 所有标记。在线/离线两种模式共用。"""
+    print()
+    print(f"{'模型':<24} {'L1视觉':>7} {'L2能力':>7} {'logit精度':>12} {'答对率':>7}  判定")
+    print("-" * 78)
+    for r in sorted(rows, key=lambda x: -(x["visual"] or 0)):
+        prec = "离线/不支持" if (r.get("offline") or not r["precision"]) else r["precision"]
+        print(f"{r['name'][:24]:<24} {_fmt_pct(r['visual']):>7} {_fmt_pct(r['capability']):>7} "
+              f"{prec:>12} {_fmt_pct(r['top1_agreement']):>7}  {verdict_line(r)}")
+    print()
+    for r in rows:
+        for fl in r["flags"]:
+            mark = {"high": "⛔", "warn": "⚠️", "info": "ℹ️"}[fl["sev"]]
+            print(f"{mark} {r['name']}：{fl['msg']}")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="modelcheck",
@@ -2367,6 +2588,10 @@ def main(argv=None) -> int:
     ap.add_argument("--save-baseline", help="把本次关键指标存成基线 JSON")
     ap.add_argument("--selftest", action="store_true", help="不需要 API key 的自检")
     ap.add_argument("--list-probes", action="store_true", help="列出所有探针")
+    ap.add_argument("--emit-prompts", metavar="DIR",
+                    help="离线模式：把题目导出成可粘贴清单（不调用任何 API）")
+    ap.add_argument("--import-dir", metavar="DIR",
+                    help="离线模式：从人工收集的回答目录生成报告（不联网）")
     args = ap.parse_args(argv)
 
     if args.selftest:
@@ -2381,10 +2606,6 @@ def main(argv=None) -> int:
         print(f"{'fingerprint':12s} {'protocol':20s} system 遵循 / model 回显 / 温度 0 确定性")
         return 0
 
-    if not args.targets:
-        ap.error("需要 --targets（或用 --selftest / --list-probes）")
-    targets = load_targets(args.targets)
-
     if args.only:
         want = {x.strip() for x in args.only.split(",") if x.strip()}
         probes = [p for p in probes if p.id in want or p.group in want]
@@ -2393,6 +2614,37 @@ def main(argv=None) -> int:
 
     def log(msg):
         print(msg, flush=True)
+
+    # ---- 离线模式 1：只导出题目 ----
+    if args.emit_prompts:
+        md = emit_prompts(args.emit_prompts, probes, log=log)
+        print(f"\n清单：{md}")
+        print(f"题目：{os.path.join(args.emit_prompts, 'prompts')}/")
+        print("\n按 PROMPTS.md 的约定收集回答后，再跑：")
+        print(f"  python3 {os.path.basename(__file__)} --import-dir answers/ --out {args.out}")
+        return 0
+
+    # ---- 离线模式 2：从人工收集的回答出报告 ----
+    if args.import_dir:
+        log(f"modelcheck v{__version__}　离线模式（人工收集）　探针 {len(probes)} 个")
+        results = load_manual_answers(args.import_dir, probes,
+                                      exec_code=not args.no_exec, log=log)
+        if not results:
+            log("没有可用的作答")
+            return 1
+        rep = write_report(args.out, results, probes)
+        _print_summary(rep["rows"])
+        if args.save_baseline:
+            with open(args.save_baseline, "w", encoding="utf-8") as f:
+                json.dump(baseline_snapshot(results), f, ensure_ascii=False, indent=2)
+            print(f"\n基线已保存：{args.save_baseline}")
+        print(f"\n报告：{rep['md']}")
+        print(f"图表：{os.path.join(args.out, 'gallery.html')}")
+        return 0
+
+    if not args.targets:
+        ap.error("需要 --targets，或用 --emit-prompts / --import-dir / --selftest / --list-probes")
+    targets = load_targets(args.targets)
 
     log(f"modelcheck v{__version__}　端点 {len(targets)} 个　探针 {len(probes)} 个")
     results = []
@@ -2412,18 +2664,7 @@ def main(argv=None) -> int:
 
     rep = write_report(args.out, results, probes)
     rows = rep["rows"]
-
-    print()
-    print(f"{'模型':<24} {'L1视觉':>7} {'L2能力':>7} {'logit精度':>12} {'答对率':>7}  判定")
-    print("-" * 78)
-    for r in sorted(rows, key=lambda x: -(x["visual"] or 0)):
-        print(f"{r['name'][:24]:<24} {_fmt_pct(r['visual']):>7} {_fmt_pct(r['capability']):>7} "
-              f"{(r['precision'] or '不支持'):>12} {_fmt_pct(r['top1_agreement']):>7}  {verdict_line(r)}")
-    print()
-    for r in rows:
-        for fl in r["flags"]:
-            mark = {"high": "⛔", "warn": "⚠️", "info": "ℹ️"}[fl["sev"]]
-            print(f"{mark} {r['name']}：{fl['msg']}")
+    _print_summary(rows)
 
     if args.baseline:
         with open(args.baseline, encoding="utf-8") as f:

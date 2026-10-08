@@ -7,6 +7,7 @@
 """
 
 import io
+import json
 import math
 import os
 import random
@@ -42,6 +43,11 @@ def synth_logprobs(fmt, seed=1, n=20, lo=-5.0, hi=25.0):
     mx = max(logits)
     lse = mx + math.log(sum(math.exp(v - mx) for v in logits))
     return sorted({M._f32(v - lse) for v in logits}, reverse=True)
+
+
+def write_text(path, text):
+    with io.open(path, "w", encoding="utf-8") as f:
+        f.write(text)
 
 
 HOUSE_SVG = ('<svg width="400" height="300" viewBox="0 0 400 300" '
@@ -426,6 +432,109 @@ class TestEndToEnd(unittest.TestCase):
             stop_b()
 
 
+
+
+class TestOfflineMode(unittest.TestCase):
+    """模型在别的 agent / 网页里、拿不到 API 时的离线收题流程。"""
+
+    def test_emit_prompts(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            probes = M.build_probes()
+            md = M.emit_prompts(td, probes)
+            self.assertTrue(os.path.exists(md))
+            self.assertTrue(os.path.exists(os.path.join(td, "prompts.json")))
+            data = json.load(io.open(os.path.join(td, "prompts.json"), encoding="utf-8"))
+            self.assertEqual(len(data), len(probes))
+            # 每题一个文件，内容必须与探针原文逐字一致（否则粘贴出去就变了）
+            for p in probes:
+                fn = os.path.join(td, "prompts", p.id + ".txt")
+                with io.open(fn, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), p.prompt, f"{p.id} 导出的题目被改写了")
+
+    def test_import_round_trip(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            ans = os.path.join(td, "answers")
+            a = os.path.join(ans, "模型甲")
+            b = os.path.join(ans, "模型乙")
+            os.makedirs(os.path.join(a, "instruction_exact"))
+            os.makedirs(b)
+            write_text(os.path.join(a, "pelican_svg.svg"),
+                       read_fixture("claude-3-5-sonnet-20241022.svg"))
+            write_text(os.path.join(b, "pelican_svg.svg"), read_fixture("gpt-3.5-turbo.svg"))
+            write_text(os.path.join(a, "arith_mul.txt"), "3309836")
+            write_text(os.path.join(b, "arith_mul.txt"), "3310636")
+            for i in (1, 2, 3):
+                io.open(os.path.join(a, "instruction_exact", f"{i}.txt"), "w",
+                        encoding="utf-8").write("please pass the ripe banana")
+
+            results = M.load_manual_answers(ans, M.build_probes())
+            self.assertEqual(len(results), 2)
+            # 中文名不能塌成同一个 slug，否则两个模型的数据会串在一起
+            self.assertEqual(len({r["slug"] for r in results}), 2)
+            by = {r["target"]["name"]: r for r in results}
+            self.assertEqual(by["模型甲"]["fingerprint"], {})   # 离线模式没有 L3
+
+            def get(res, pid):
+                return next(r for r in res["runs"] if r["probe_id"] == pid)
+
+            self.assertGreater(get(by["模型甲"], "pelican_svg")["score"],
+                               get(by["模型乙"], "pelican_svg")["score"])
+            self.assertEqual(get(by["模型甲"], "arith_mul")["score"], 1.0)
+            self.assertEqual(get(by["模型乙"], "arith_mul")["score"], 0.0)
+            # 未提交的题必须标成失败并从平均分里剔除
+            missing = get(by["模型甲"], "needle")
+            self.assertFalse(missing["ok"])
+            self.assertIn("未提交", missing["detail"])
+            # 重复提交的题要能算出一致性
+            ie = get(by["模型甲"], "instruction_exact")
+            self.assertEqual(ie["consistency"], 1.0)
+            self.assertEqual(ie["score"], 1.0)
+
+            rep = M.write_report(os.path.join(td, "out"), results, M.build_probes())
+            self.assertTrue(os.path.exists(os.path.join(td, "out", "gallery.html")))
+            rows = {r["name"]: r for r in rep["rows"]}
+            self.assertGreater(rows["模型甲"]["visual"], rows["模型乙"]["visual"])
+            self.assertTrue(any(f["kind"] == "no_fingerprint"
+                                for f in rows["模型甲"]["flags"]))
+
+    def test_flat_naming_convention(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            write_text(os.path.join(td, "厂商A__arith_mul.txt"), "3309836")
+            results = M.load_manual_answers(td, M.build_probes())
+            self.assertEqual([r["slug"] for r in results], ["厂商A"])
+            run = next(r for r in results[0]["runs"] if r["probe_id"] == "arith_mul")
+            self.assertEqual(run["score"], 1.0)
+
+    def test_empty_dir_is_friendly_error(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(SystemExit) as cm:
+                M.load_manual_answers(td, M.build_probes())
+            self.assertIn("没找到", str(cm.exception))
+
+    def test_pasted_quotes_are_tolerated(self):
+        """从对话框复制 JSON 常会多带一层引号，不该因此判 0 分。"""
+        params = {"schema": {"name": "str", "age": "int", "tags": "array"}, "array_len": 3}
+        quoted = '"{\\"name\\": \\"x\\", \\"age\\": 3, \\"tags\\": [\\"a\\",\\"b\\",\\"c\\"]}"'
+        s, det = M.check_json(quoted, params,
+                              M.CallResult(ok=True, text=quoted))
+        self.assertGreater(s, 0.9, det)
+        # 但真的不是对象时依然要判低分
+        s, _ = M.check_json('"just a string"', params, M.CallResult(ok=True, text=""))
+        self.assertLess(s, 0.5)
+
+    def test_slug_is_stable_and_unique(self):
+        self.assertEqual(M.Target("模型甲", "u").slug, "模型甲")
+        self.assertNotEqual(M.Target("模型甲", "u").slug, M.Target("模型乙", "u").slug)
+        # 全是符号的名字也要能得到稳定且非空的 slug
+        s1 = M.Target("!!!", "u").slug
+        self.assertTrue(s1)
+        self.assertEqual(s1, M.Target("!!!", "u").slug)
+        self.assertNotEqual(s1, M.Target("???", "u").slug)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-
