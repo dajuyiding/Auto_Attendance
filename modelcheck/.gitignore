@@ -1,0 +1,4 @@
+selftest-run/
+runs/
+*.pyc
+__pycache__/

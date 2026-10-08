@@ -47,6 +47,7 @@ import datetime as _dt
 import json
 import math
 import os
+import random
 import re
 import statistics
 import struct
@@ -492,7 +493,8 @@ def _find_pelican_and_bike(a: SvgAnalysis):
             if s.cx is None:
                 continue
             if s.cy < by0 + 0.15 * (by1 - by0) and abs(s.cx - a.body.cx) < 1.6 * a.body.w:
-                if s.w < 1.3 * a.body.w:
+                # 头必须是个「有份量」的块，不能是眼睛那种小圆点
+                if 0.10 * a.body.w < s.w < 1.3 * a.body.w:
                     head_cands.append(s)
         if head_cands:
             a.head = min(head_cands, key=lambda s: s.cy)
@@ -667,6 +669,50 @@ def score_svg(a: SvgAnalysis) -> dict:
     return _finish(crit)
 
 
+def score_svg_generic(a: SvgAnalysis) -> dict:
+    """通用 SVG 质量分：不假设画的是什么，只看「像不像一张认真画出来的图」。
+
+    用于控制组（房子）和非自行车类探针（独轮车）。
+    """
+    crit = []
+    if not a.ok:
+        _mk(crit, "valid_svg", "SVG 合法性", 0.0, 0.20, a.reason)
+        return _finish(crit)
+    _mk(crit, "valid_svg", "SVG 合法性",
+        1.0 if (a.has_viewbox or a.has_width_height) and a.xml_valid else
+        (0.7 if a.has_viewbox or a.has_width_height else 0.4), 0.20,
+        ("有 viewBox/尺寸且 XML 合法" if a.xml_valid else "XML 不合法"))
+    _mk(crit, "canvas", "画布自洽", 1.0 if a.has_viewbox else 0.5, 0.10,
+        "有 viewBox" if a.has_viewbox else "没有 viewBox")
+    n = a.n_elements
+    s = 0.0 if n < 4 else (0.3 if n < 8 else 0.6 if n < 12 else 0.85 if n < 18 else 1.0)
+    _mk(crit, "complexity", "结构复杂度", s, 0.20, f"{n} 个元素、{a.n_shapes} 个图元")
+    c = a.distinct_colors
+    _mk(crit, "color", "用色", 0.0 if c <= 1 else (0.5 if c == 2 else 1.0), 0.15,
+        f"{c} 种颜色")
+    tech, bits = 0.0, []
+    if a.n_curves:
+        tech += 0.3; bits.append(f"{a.n_curves} 条曲线")
+    if a.n_groups:
+        tech += 0.2; bits.append(f"{a.n_groups} 个 <g>")
+    if re.search(r"stroke-width\s*=", a.raw):
+        tech += 0.2; bits.append("stroke-width")
+    if a.has_viewbox:
+        tech += 0.3; bits.append("viewBox")
+    _mk(crit, "technique", "技法丰富度", min(1.0, tech), 0.20, "、".join(bits) or "只有最基本图元")
+    s, notes = 1.0, []
+    if a.n_text > 2:
+        s -= 0.4; notes.append(f"{a.n_text} 个 <text> 当主体")
+    if a.duplicate_ratio > 0.6:
+        s -= 0.4; notes.append("大量元素完全重复")
+    if a.chars < 300:
+        s -= 0.3; notes.append("投入极低")
+    if not a.xml_valid:
+        s -= 0.25; notes.append("XML 不合法")
+    _mk(crit, "cleanliness", "干净度", s, 0.15, "；".join(notes) or "没有退化特征")
+    return _finish(crit)
+
+
 def score_html(text: str) -> dict:
     """给「自包含 HTML 动画」打分。"""
     crit = []
@@ -806,6 +852,99 @@ def pick_richest_position(logprobs: list) -> int:
     return best_i
 
 
+_FINE_FORMATS = ["fp8_e5m2", "fp8_e4m3", "bf16", "fp16"]
+
+
+def _nearest(x: float, fmt: str):
+    """返回 fmt 中离 x 最近的可表示值。"""
+    if x == 0.0:
+        return 0.0
+    if fmt == "fp32":
+        return _f32(x)
+    if fmt == "fp16":
+        try:
+            return struct.unpack("<e", struct.pack("<e", x))[0]
+        except (OverflowError, struct.error):
+            return math.copysign(65504.0, x)
+    if fmt == "bf16":
+        bits = struct.unpack("<I", struct.pack("<f", _f32(x)))[0]
+        bits = (bits + 0x8000) & 0xFFFF0000      # 就近舍入到 bf16
+        return struct.unpack("<f", struct.pack("<I", bits))[0]
+    s = _FP8_E4M3 if fmt == "fp8_e4m3" else _FP8_E5M2
+    return min(s, key=lambda v: abs(v - abs(x))) * (1 if x >= 0 else -1)
+
+
+def _near(x: float, fmt: str, eps: float) -> bool:
+    """x 是否落在 fmt 的格点上（允许 eps 的绝对容差）。
+
+    真实 API 返回的 logprob 是 fp32，往返一次必然有 ~1 ulp 的舍入误差，
+    所以不能要求「完全相等」，只能要求「离最近格点足够近」。
+    """
+    return abs(x - _nearest(x, fmt)) <= eps
+
+
+def _positive_values(fmt: str, lo: float, hi: float) -> list:
+    """枚举 fmt 在 [lo, hi] 内的正的可表示值。"""
+    if hi <= 0:
+        return []
+    lo = max(lo, 1e-9)
+    if fmt.startswith("fp8"):
+        s = _FP8_E4M3 if fmt == "fp8_e4m3" else _FP8_E5M2
+        return sorted(v for v in s if lo <= v <= hi)
+    mb, clo, chi = {"fp16": (10, -14, 15), "bf16": (7, -126, 127)}[fmt]
+    e0 = max(clo, int(math.floor(math.log2(lo))))
+    e1 = min(chi, int(math.ceil(math.log2(hi))))
+    n = 1 << mb
+    out = []
+    for e in range(e0, e1 + 1):
+        base = 2.0 ** e
+        for m in range(n):
+            v = (1.0 + m / n) * base
+            if lo <= v <= hi:
+                out.append(v)
+    return out
+
+
+def _values_in_range(fmt: str, lo: float, hi: float) -> list:
+    """fmt 在 [lo, hi] 内所有（含负）可表示值，作为候选「原始 logits」的取值域。"""
+    if lo > hi:
+        return []
+    pos = _positive_values(fmt, max(lo, 0.0), hi)
+    neg = [-v for v in _positive_values(fmt, max(-hi, 0.0), max(-lo, 0.0))]
+    out = set(pos) | set(neg)
+    if lo <= 0.0 <= hi:
+        out.add(0.0)
+    return sorted(out)
+
+
+def _find_shift(vals: list, fmt: str, logit_lo: float = -70.0,
+                logit_hi: float = 140.0, rel_eps: float = 4e-6):
+    """找一个平移量 C，使所有 (val + C) 都落在 fmt 的格点上。
+
+    做法是枚举「第一个 logprob 对应的原始 logit」在 fmt 上的所有可能取值 s，
+    令 C = s - vals[0]，再校验其余 logprob 是否同时落在格点上。
+    第一个 logprob 是 top-1，对应的 logit 就是最大 logit，通常为正且不大，
+    所以枚举区间取 [-70, 140] 足够覆盖真实模型的取值范围。
+
+    返回 (C, 平均残差)；找不到返回 (None, None)。残差是「离最近格点的距离」，
+    可以当作置信度看：残差越小、命中越干净。
+    """
+    if not vals:
+        return None, None
+    base = vals[0]
+    for s in _values_in_range(fmt, logit_lo, logit_hi):
+        c = s - base
+        if not (-100.0 <= c <= 200.0):
+            continue
+        res = []
+        for v in vals:
+            x = _f32(v + c)
+            res.append(abs(x - _nearest(x, fmt)))
+        if max(res) <= rel_eps * max(1.0, abs(base + c)):
+            return c, sum(res) / len(res)
+    return None, None
+
+
 def infer_logit_precision(vals: list, n_use: int = 20) -> dict:
     """仅凭一批 logprob 反推 logits 的浮点精度。
 
@@ -823,24 +962,17 @@ def infer_logit_precision(vals: list, n_use: int = 20) -> dict:
         return {"ok": False, "reason": f"可用的 logprob 太少（{len(vals)} 个，至少 5 个）"}
     vals = vals[:n_use]
 
-    def search(fmt, lo, hi, step):
-        c = lo
-        while c <= hi:
-            if all(_representable(_f32(v + c), fmt) for v in vals):
-                return c
-            c += step
-        return None
-
     hits = {}
-    for fmt in _FORMATS:
-        step = 1 / 256
-        c = search(fmt, -8.0, 40.0, step)
+    for fmt in _FINE_FORMATS:
+        c, resid = _find_shift(vals, fmt)
         if c is not None:
-            c2 = search(fmt, c - step, c + step, step / 256)
-            hits[fmt] = round(c2 if c2 is not None else c, 6)
+            hits[fmt] = {"shift": round(c, 8), "residual": resid}
 
     if not hits:
-        return {"ok": False, "reason": "没有找到任何标准浮点格式能解释这批 logprob"}
+        return {"ok": True, "precision": "fp32", "mantissa_bits": 23,
+                "all_matching": ["fp32"], "shifts": {}, "n_used": len(vals),
+                "note": "没有任何粗于 fp32 的格式能解释这批 logprob，按 fp32 处理"
+                        "（也可能使用了不在检测范围内的量化方案，属于已知盲区）"}
     best = min(hits, key=lambda f: _MANTISSA_BITS[f])
     return {
         "ok": True,
@@ -1095,9 +1227,10 @@ def build_probes() -> list:
             kind="html", max_tokens=6000,
             desc="升级版：动画 HTML，额外考察时序/状态组织能力"))
     A(Probe("capybara_unicycle", "visual", "Generate an SVG of a capybara riding a unicycle",
-            kind="svg", desc="换一个同样罕见的组合，排除背答案"))
+            kind="svg", params={"scorer": "generic"},
+            desc="换一个同样罕见的组合，排除背答案"))
     A(Probe("scene_control", "visual", "Generate an SVG of a house with a door and two windows",
-            kind="svg", max_tokens=2000,
+            kind="svg", max_tokens=2000, params={"scorer": "generic"},
             desc="对照组：简单场景。连这个都画不好说明模型已严重受损"))
 
     # ---------------- L2 确定性能力 ----------------
@@ -1199,15 +1332,1114 @@ def extract_code(text: str, lang_hints=("svg", "html", "xml", "python", "py")) -
     blocks = _FENCE_RE.findall(text)
     if blocks:
         return max(blocks, key=len).strip()  # 最长的通常才是完整实现
-    m = re.search(r"<svg[\s\S]*?</svg>", text, re.I)
-    if m:
-        return m.group(0).strip()
     m = re.search(r"<!DOCTYPE html[\s\S]*", text, re.I)
     if m:
         return m.group(0).strip()
     m = re.search(r"<html[\s\S]*?</html>", text, re.I)
     if m:
         return m.group(0).strip()
+    m = re.search(r"<svg[\s\S]*?</svg>", text, re.I)
+    if m:
+        return m.group(0).strip()
     return text.strip()
 
 SVG_NS = "http://www.w3.org/2000/svg"
+
+
+# --------------------------------------------------------------------------
+# L3：指纹探针（量化 / 换模型检测）
+# --------------------------------------------------------------------------
+
+# 这些提示的「下一个 token」几乎是被锁死的，量化后 logprob 会先变糊、再答错
+LOGPROB_BATTERY = [
+    ("2 + 2 =", "4"),
+    ("The capital of France is", "Paris"),
+    ("1, 2, 3, 4, 5,", "6"),
+    ("The opposite of hot is", "cold"),
+    ("The first letter of the alphabet is", "A"),
+    ("Roses are red, violets are", "blue"),
+    ("The sun rises in the", "east"),
+    ("7 times 8 equals", "56"),
+    ("The chemical symbol for gold is", "Au"),
+    ("Water is made of hydrogen and", "oxygen"),
+    ("The largest planet in our solar system is", "Jupiter"),
+    ("Python's file extension is dot", "py"),
+]
+
+# 固定字符串的 prompt_tokens 由 tokenizer 决定；同一个标称模型在不同供应商处
+# 应该给出完全一致的计数。对不上 = 底层不是同一个 tokenizer = 换了模型。
+TOKENIZER_STRINGS = [
+    "hello world",
+    "The quick brown fox jumps over the lazy dog.",
+    "中华人民共和国",
+    "def f(x): return x**2",
+    "1234567890",
+]
+
+
+def run_logprob_battery(target: Target, top_logprobs: int = 20) -> dict:
+    """12 个高确定性提示 + max_tokens=1，量测分布糊度并反推 logit 精度。"""
+    per_prompt, all_positions, errs = [], [], []
+    for prompt, expect in LOGPROB_BATTERY:
+        r = call_chat(target, [{"role": "user", "content": prompt}],
+                      max_tokens=1, temperature=0.0, want_logprobs=True,
+                      top_logprobs=top_logprobs)
+        if not r.ok:
+            errs.append(f"{prompt!r}: {r.error[:80]}")
+            continue
+        st = logprob_stats(r.logprobs)
+        chosen = ""
+        if r.logprobs and isinstance(r.logprobs[0], dict):
+            chosen = (r.logprobs[0].get("token") or "").strip()
+        hit = _norm(chosen) == _norm(expect) or (chosen and _norm(expect) in _norm(chosen))
+        per_prompt.append({
+            "prompt": prompt, "expected": expect, "got": chosen,
+            "match": bool(hit), "top1_prob": st.get("mean_top1_prob"),
+            "entropy": st.get("mean_entropy"),
+        })
+        all_positions.extend(r.logprobs or [])
+
+    if not per_prompt:
+        return {"ok": False, "reason": "logprobs 全部失败", "errors": errs[:3],
+                "supported": False}
+
+    agg = logprob_stats(all_positions)
+    # 精度反推：挑 top-k 最丰富的位置
+    idx = pick_richest_position(all_positions)
+    prec = infer_logit_precision(position_logprobs(all_positions, idx))
+    matches = sum(1 for p in per_prompt if p["match"])
+    return {
+        "ok": True, "supported": True,
+        "n_prompts": len(per_prompt),
+        "top1_agreement": round(matches / len(per_prompt), 3),
+        "mean_top1_prob": agg.get("mean_top1_prob"),
+        "mean_entropy": agg.get("mean_entropy"),
+        "mean_margin": agg.get("mean_margin"),
+        "precision": prec,
+        "per_prompt": per_prompt,
+        "errors": errs[:3],
+    }
+
+
+def run_tokenizer_fp(target: Target) -> dict:
+    """用固定字符串的 prompt_tokens 给 tokenizer 打指纹。"""
+    counts, errs = {}, []
+    for s in TOKENIZER_STRINGS:
+        r = call_chat(target, [{"role": "user", "content": s}],
+                      max_tokens=1, temperature=0.0)
+        if not r.ok:
+            errs.append(f"{s!r}: {r.error[:60]}")
+            continue
+        n = (r.usage or {}).get("prompt_tokens")
+        if n is None:
+            # 有些网关不返回 usage，退回按字符数估（只能横向比，不能绝对判定）
+            n = None
+        counts[s] = n
+    have = [n for n in counts.values() if n is not None]
+    return {
+        "ok": bool(have),
+        "counts": counts,
+        "fingerprint": have or None,
+        "note": "同一标称模型在不同供应商处这几个数必须完全一致"
+                if have else "网关未返回 usage.prompt_tokens，无法比对",
+        "errors": errs[:2],
+    }
+
+
+def run_protocol_probe(target: Target) -> dict:
+    """协议与行为指纹：system 遵循、model 回显、usage、温度 0 的确定性。"""
+    out = {}
+
+    r = call_chat(target, [
+        {"role": "system", "content": "You must answer with exactly one word, in French, and nothing else."},
+        {"role": "user", "content": "What colour is a clear daytime sky?"},
+    ], max_tokens=32, temperature=0.0)
+    if r.ok:
+        words = re.findall(r"[A-Za-zÀ-ÿ']+", r.text or "")
+        out["system_followed"] = (len(words) == 1)
+        out["system_answer"] = (r.text or "").strip()[:40]
+    else:
+        out["system_followed"] = None
+        out["system_answer"] = ""
+        out["system_error"] = r.error[:120]
+
+    r2 = call_chat(target, [{"role": "user", "content": "Say the single word: ok"}],
+                   max_tokens=8, temperature=0.0)
+    out["model_echo"] = r2.model_echo if r2.ok else ""
+    out["usage_present"] = bool(r2.ok and (r2.usage or {}).get("total_tokens"))
+
+    # 温度 0 跑 3 次是否一致（非确定性本身也是「后面挂了别的实现」的信号）
+    texts = []
+    for _ in range(3):
+        rr = call_chat(target, [{"role": "user",
+                                 "content": "Name a random number between 1 and 1000. Digits only."}],
+                       max_tokens=8, temperature=0.0)
+        if rr.ok:
+            texts.append((rr.text or "").strip())
+    out["determinism_samples"] = texts
+    out["deterministic"] = (len(set(texts)) == 1) if len(texts) >= 2 else None
+    return out
+
+
+# --------------------------------------------------------------------------
+# 运行器
+# --------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class ProbeRun:
+    probe_id: str
+    group: str
+    kind: str = "text"
+    desc: str = ""
+    weight: float = 1.0
+    ok: bool = False
+    score: float = 0.0
+    detail: str = ""
+    error: str = ""
+    text: str = ""
+    code: str = ""
+    criteria: list = dataclasses.field(default_factory=list)
+    analysis: dict = dataclasses.field(default_factory=dict)
+    latency_ms: int = 0
+    finish_reason: str = ""
+    consistency: float | None = None
+    scored: bool = True
+    extra: dict = dataclasses.field(default_factory=dict)
+
+
+def _svg_summary(a: SvgAnalysis) -> dict:
+    return {
+        "xml_valid": a.xml_valid, "n_elements": a.n_elements, "n_shapes": a.n_shapes,
+        "n_paths": a.n_paths, "n_groups": a.n_groups, "n_curves": a.n_curves,
+        "n_text": a.n_text, "canvas": [a.canvas_w, a.canvas_h],
+        "has_viewbox": a.has_viewbox, "distinct_colors": a.distinct_colors,
+        "wheels_found": a.wheel_pair is not None,
+        "body_found": a.body is not None, "head_found": a.head is not None,
+        "beak_found": a.beak is not None, "n_legs": a.n_legs,
+        "n_frame_lines": a.n_frame_lines, "chars": a.chars,
+        "duplicate_ratio": round(a.duplicate_ratio, 3),
+    }
+
+
+def run_probe(target: Target, probe: Probe, exec_code: bool = True) -> ProbeRun:
+    """跑一个探针。runs>1 时会重复跑并给出「一致性」分。"""
+    run = ProbeRun(probe_id=probe.id, group=probe.group, kind=probe.kind,
+                   desc=probe.desc, weight=probe.weight)
+
+    messages = []
+    if probe.system:
+        messages.append({"role": "system", "content": probe.system})
+    messages.append({"role": "user", "content": probe.prompt})
+
+    n = max(1, probe.runs)
+    results, texts = [], []
+    for _ in range(n):
+        r = call_chat(target, messages, max_tokens=probe.max_tokens,
+                      temperature=probe.temperature, want_logprobs=probe.needs_logprobs)
+        results.append(r)
+        if r.ok:
+            texts.append(r.text or "")
+        run.latency_ms = max(run.latency_ms, r.latency_ms)
+
+    good = [r for r in results if r.ok]
+    if not good:
+        run.ok = False
+        run.error = (results[0].error if results else "没有结果")[:300]
+        run.detail = "调用失败"
+        return run
+
+    run.ok = True
+    run.finish_reason = good[0].finish_reason
+    run.text = good[0].text or ""
+    if len(texts) >= 2:
+        # 一致性：多数投票占比
+        modal = max(set(texts), key=texts.count)
+        run.consistency = round(texts.count(modal) / len(texts), 3)
+
+    # 视觉类：抠代码 → 结构分析 → 打分
+    if probe.kind in ("svg", "html"):
+        run.code = extract_code(run.text)
+        if probe.kind == "svg":
+            a = analyze_svg(run.code)
+            scorer = score_svg_generic if probe.params.get("scorer") == "generic" else score_svg
+            s = scorer(a)
+            run.analysis = _svg_summary(a)
+            run.criteria = s["criteria"]
+            run.score = s["score"]
+            run.detail = ("结构完整" if run.score > 0.75 else
+                          "基本成形" if run.score > 0.5 else
+                          "明显缺件" if run.score > 0.3 else "几乎不成形")
+        else:
+            m = re.search(r"<svg[\s\S]*?</svg>", run.code, re.I)
+            run.analysis = _svg_summary(analyze_svg(m.group(0))) if m else {}
+            s = score_html(run.code)
+            run.criteria = s["criteria"]
+            run.score = s["score"]
+            run.detail = f"HTML 动画综合 {run.score*100:.0f}"
+        if run.consistency is not None:
+            run.score *= 0.5 + 0.5 * run.consistency
+        return run
+
+    # 文本类：走 checker
+    if probe.checker:
+        fn = CHECKERS.get(probe.checker)
+        if not fn:
+            run.score, run.detail = 0.0, f"未知检查器 {probe.checker}"
+            return run
+        if probe.checker == "python" and not exec_code:
+            run.score, run.detail = 0.0, "已用 --no-exec 禁用代码执行"
+            return run
+        scores, details = [], []
+        for r in good:
+            sc, dt = fn(r.text, probe.params, r)
+            scores.append(sc)
+            details.append(dt)
+        run.score = sum(scores) / len(scores)
+        run.detail = details[0]
+        if len(set(details)) > 1:
+            run.detail += f"（{len(set(details))} 次结果不同）"
+        return run
+
+    # 只记录不判分的探针
+    run.scored = False
+    run.score = 0.0
+    run.detail = run.text.strip()[:200]
+    return run
+
+
+def _save_artifact(tdir: str, run: ProbeRun):
+    if not run.ok:
+        return
+    ext = {"svg": ".svg", "html": ".html"}.get(run.kind, ".txt")
+    body = run.code if run.kind in ("svg", "html") and run.code else run.text
+    with open(os.path.join(tdir, run.probe_id + ext), "w", encoding="utf-8") as f:
+        f.write(body or "")
+    if run.kind == "html":
+        # 也存一份纯 SVG，方便直接看图
+        code = run.code or run.text
+        m = re.search(r"<svg[\s\S]*?</svg>", code, re.I)
+        if m:
+            with open(os.path.join(tdir, run.probe_id + ".svg"), "w", encoding="utf-8") as f:
+                f.write(m.group(0))
+
+
+def run_target(target: Target, probes: list, outdir: str,
+               exec_code: bool = True, jobs: int = 1,
+               do_fingerprint: bool = True, log=lambda *_a: None) -> dict:
+    """把一个 target 上的所有探针跑完，返回原始结果（同时落盘）。"""
+    tdir = os.path.join(outdir, target.slug)
+    os.makedirs(tdir, exist_ok=True)
+    log(f"  [{target.name}] 跑 {len(probes)} 个探针...")
+
+    def work(p):
+        return run_probe(target, p, exec_code=exec_code)
+
+    if jobs > 1 and len(probes) > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
+            runs = list(ex.map(work, probes))
+    else:
+        runs = [work(p) for p in probes]
+
+    for r in runs:
+        _save_artifact(tdir, r)
+
+    fp = {}
+    if do_fingerprint:
+        log(f"  [{target.name}] 跑 L3 指纹（logprob / tokenizer / 协议）...")
+        fp["logprob"] = run_logprob_battery(target)
+        fp["tokenizer"] = run_tokenizer_fp(target)
+        fp["protocol"] = run_protocol_probe(target)
+
+    return {
+        "target": dataclasses.asdict(target) | {"api_key": "***" if target.api_key else ""},
+        "slug": target.slug,
+        "runs": [dataclasses.asdict(r) for r in runs],
+        "fingerprint": fp,
+    }
+
+
+def group_scores(runs: list) -> dict:
+    """按 group 汇总加权分数。"""
+    out = {}
+    for g in ("visual", "capability"):
+        rs = [r for r in runs if r["group"] == g and r["ok"] and r.get("scored", True)]
+        if not rs:
+            out[g] = None
+            continue
+        wsum = sum(r["weight"] for r in rs)
+        out[g] = round(sum(r["score"] * r["weight"] for r in rs) / wsum, 4) if wsum else None
+    return out
+
+
+# --------------------------------------------------------------------------
+# 判定引擎：把多路信号合成「量化 / 换模型 / 能力差距」的结论
+# --------------------------------------------------------------------------
+
+_PREC_LABEL = {
+    "fp32": "FP32（全精度）",
+    "fp16": "FP16",
+    "bf16": "BF16",
+    "fp8_e4m3": "FP8-E4M3（低精度）",
+    "fp8_e5m2": "FP8-E5M2（很低精度）",
+}
+
+
+def analyze_fleet(results: list, gap: float = 0.18) -> list:
+    """横向对比所有 target，给出可解释的判定。
+
+    单个 target 内部无法判断「好不好」，只有横向对比才有意义：
+    同一批探针下，分数明显掉队 / 分布明显变糊 / 指纹对不上的那个，才可疑。
+    """
+    rows = []
+    for res in results:
+        gs = group_scores(res["runs"])
+        fp = res.get("fingerprint") or {}
+        lp = fp.get("logprob") or {}
+        prec = (lp.get("precision") or {}).get("precision") if lp.get("ok") else None
+        rows.append({
+            "slug": res["slug"],
+            "name": res["target"].get("name", res["slug"]),
+            "model": res["target"].get("model", ""),
+            "visual": gs.get("visual"),
+            "capability": gs.get("capability"),
+            "top1_agreement": lp.get("top1_agreement"),
+            "mean_top1_prob": lp.get("mean_top1_prob"),
+            "mean_entropy": lp.get("mean_entropy"),
+            "precision": prec,
+            "tokenizer": (fp.get("tokenizer") or {}).get("fingerprint"),
+            "deterministic": (fp.get("protocol") or {}).get("deterministic"),
+            "model_echo": (fp.get("protocol") or {}).get("model_echo"),
+            "flags": [],
+        })
+
+    def best(key):
+        vals = [r[key] for r in rows if r.get(key) is not None]
+        return max(vals) if vals else None
+
+    vbest, cbest = best("visual"), best("capability")
+    pbest = None
+    for r in rows:
+        if r["precision"]:
+            pbest = r["precision"] if pbest is None else (
+                pbest if _MANTISSA_BITS.get(pbest, 23) >= _MANTISSA_BITS.get(r["precision"], 23)
+                else r["precision"])
+
+    for r in rows:
+        f = r["flags"]
+        if r["visual"] is not None and vbest is not None and vbest - r["visual"] >= gap:
+            f.append({"sev": "warn", "kind": "visual_gap",
+                      "msg": f"视觉分比同批最好低 {(vbest-r['visual'])*100:.0f} 分"})
+        if r["capability"] is not None and cbest is not None and cbest - r["capability"] >= gap:
+            f.append({"sev": "warn", "kind": "capability_gap",
+                      "msg": f"能力分比同批最好低 {(cbest-r['capability'])*100:.0f} 分"})
+        if r["top1_agreement"] is not None and r["top1_agreement"] < 0.85:
+            f.append({"sev": "warn", "kind": "logprob_disagree",
+                      "msg": f"高确定性提示只有 {r['top1_agreement']*100:.0f}% 答对，分布已经不稳"})
+        if r["precision"]:
+            mb = _MANTISSA_BITS.get(r["precision"], 23)
+            if mb <= 3:
+                f.append({"sev": "high", "kind": "low_precision",
+                          "msg": f"logits 精度反推为 {_PREC_LABEL.get(r['precision'], r['precision'])}，"
+                                 "远低于同批其他端点，强烈提示低精度推理 / 量化"})
+            elif mb <= 10 and pbest is not None and _MANTISSA_BITS.get(pbest, 23) > mb:
+                f.append({"sev": "warn", "kind": "low_precision",
+                          "msg": f"logits 精度反推为 {_PREC_LABEL.get(r['precision'], r['precision'])}，"
+                                 f"比同批最精细的 {_PREC_LABEL.get(pbest, pbest)} 粗一档"})
+            elif mb <= 10:
+                f.append({"sev": "info", "kind": "precision_normal",
+                          "msg": f"logits 精度反推为 {_PREC_LABEL.get(r['precision'], r['precision'])}"
+                                 "（BF16/FP16 是现代推理的常态，本身不构成量化证据）"})
+        if r["deterministic"] is False:
+            f.append({"sev": "info", "kind": "nondeterministic",
+                      "msg": "温度 0 下三次结果不一致（网关缓存/路由或采样参数被改写）"})
+
+    # tokenizer 交叉比对：同 model 字段但指纹不同 = 换模型
+    by_model = {}
+    for r in rows:
+        if r["tokenizer"] and r["model"]:
+            by_model.setdefault(r["model"], []).append(r)
+    for model, group in by_model.items():
+        sigs = {tuple(r["tokenizer"]) for r in group}
+        if len(sigs) > 1:
+            for r in group:
+                r["flags"].append({"sev": "high", "kind": "tokenizer_mismatch",
+                                   "msg": f"同为 {model}，但 tokenizer 指纹与别的供应商不一致 → 底层很可能不是同一个模型"})
+    return rows
+
+
+def verdict_line(r: dict) -> str:
+    highs = [f for f in r["flags"] if f["sev"] == "high"]
+    if highs:
+        return "⛔ 可疑"
+    warns = [f for f in r["flags"] if f["sev"] == "warn"]
+    if warns:
+        return "⚠️ 有差距"
+    if r["visual"] is not None or r["capability"] is not None:
+        return "✅ 正常"
+    return "— 数据不足"
+
+
+# --------------------------------------------------------------------------
+# 报告输出
+# --------------------------------------------------------------------------
+def _fmt_pct(x):
+    return "—" if x is None else f"{x*100:.0f}"
+
+
+def write_report(outdir: str, results: list, probes: list) -> dict:
+    rows = analyze_fleet(results)
+    by_slug = {r["slug"]: r for r in rows}
+
+    os.makedirs(outdir, exist_ok=True)
+    with open(os.path.join(outdir, "report.json"), "w", encoding="utf-8") as f:
+        json.dump({"generated": _dt.datetime.now().isoformat(timespec="seconds"),
+                   "version": __version__, "verdicts": rows, "results": results},
+                  f, ensure_ascii=False, indent=2)
+
+    L = []
+    L.append("# 模型成色体检报告")
+    L.append("")
+    L.append(f"生成时间：{_dt.datetime.now():%Y-%m-%d %H:%M:%S}　探针数：{len(probes)}")
+    L.append("")
+    L.append("## 总览")
+    L.append("")
+    L.append("| 模型 | L1 视觉 | L2 能力 | logit 精度 | 高确定性答对率 | 判定 |")
+    L.append("|---|---|---|---|---|---|")
+    for r in sorted(rows, key=lambda x: -(x["visual"] or 0)):
+        L.append(f"| {r['name']} | {_fmt_pct(r['visual'])} | {_fmt_pct(r['capability'])} | "
+                 f"{_PREC_LABEL.get(r['precision'], '—') if r['precision'] else '不支持 logprobs'} | "
+                 f"{_fmt_pct(r['top1_agreement'])} | {verdict_line(r)} |")
+    L.append("")
+    L.append("> 分数都是**横向相对值**：只有把同一批探针同时跑在多个供应商上才有意义。")
+    L.append("")
+
+    for r in sorted(rows, key=lambda x: -(x["visual"] or 0)):
+        res = next((x for x in results if x["slug"] == r["slug"]), None)
+        L.append(f"## {r['name']}")
+        L.append("")
+        if r["model"]:
+            L.append(f"模型字段：`{r['model']}`　回显：`{r['model_echo'] or '—'}`")
+        if r["flags"]:
+            for fl in r["flags"]:
+                mark = {"high": "⛔", "warn": "⚠️", "info": "ℹ️"}[fl["sev"]]
+                L.append(f"- {mark} {fl['msg']}")
+        else:
+            L.append("- ✅ 没有检出异常信号")
+        L.append("")
+        # 探针明细
+        L.append("| 探针 | 组 | 分数 | 说明 |")
+        L.append("|---|---|---|---|")
+        for run in (res or {}).get("runs", []):
+            if not run["ok"]:
+                sc = "✗"
+            elif not run.get("scored", True):
+                sc = "仅记录"
+            else:
+                sc = f"{run['score']*100:.0f}"
+            det = (run.get("error") or run.get("detail") or "").replace("|", "/")[:120]
+            L.append(f"| `{run['probe_id']}` | {run['group']} | {sc} | {det} |")
+        L.append("")
+        # L3 细节
+        fp = (res or {}).get("fingerprint") or {}
+        lp = fp.get("logprob") or {}
+        if lp.get("ok"):
+            L.append("**L3 分布指纹**")
+            L.append("")
+            L.append(f"- 高确定性提示答对率：{_fmt_pct(lp.get('top1_agreement'))}%")
+            L.append(f"- 首 token top-1 平均概率：{lp.get('mean_top1_prob')}（越高越自信）")
+            L.append(f"- 首 token 平均熵：{lp.get('mean_entropy')}（越低越确定）")
+            pr = lp.get("precision") or {}
+            if pr.get("ok"):
+                L.append(f"- logit 精度反推：**{_PREC_LABEL.get(pr['precision'], pr['precision'])}**"
+                         f"（尾数 {pr['mantissa_bits']} 位；可匹配 {', '.join(pr['all_matching'])}）")
+            else:
+                L.append(f"- logit 精度反推：无法判定（{pr.get('reason')}）")
+            L.append("")
+        elif fp:
+            L.append(f"**L3 分布指纹**：该网关不支持 logprobs（{lp.get('reason','未返回')}），"
+                     "量化检测能力受限，只能依赖 L1/L2 与 tokenizer 指纹。")
+            L.append("")
+        tok = fp.get("tokenizer") or {}
+        if tok.get("fingerprint"):
+            L.append(f"tokenizer 指纹（prompt_tokens）：{tok['fingerprint']}")
+            L.append("")
+
+    L.append("---")
+    L.append("")
+    L.append("## 判据说明（为什么可以这样判）")
+    L.append("")
+    for line in JUDGE_NOTES:
+        L.append(f"- {line}")
+    L.append("")
+
+    with open(os.path.join(outdir, "report.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(L))
+
+    write_gallery(outdir, results, probes)
+    return {"rows": rows, "md": os.path.join(outdir, "report.md")}
+
+
+JUDGE_NOTES = [
+    "鹈鹕骑自行车这个组合天然稀缺（训练集里几乎没有现成图），模型没法「背答案」，"
+    "只能真的把「鸟坐在车架上、脚够到踏板、翅膀扶车把」的空间关系推出来。",
+    "视觉探针的自动打分只看结构：轮子是否是两个尺寸接近的圆、车架是否存在、"
+    "鹈鹕的头/喙/腿是否落在正确位置。它抓得住「缺件」，抓不住审美，所以 gallery.html 里的人工看图仍是最终裁判。",
+    "多位数乘法、字母计数、严格 JSON、精确词数这类任务几乎不需要「聪明」，"
+    "但需要完整的数值/符号通路。量化和小模型最先崩的就是这些。",
+    "logprob 是唯一能黑盒量测「分布糊度」的信号：高确定性提示下，"
+    "好的模型 top-1 概率接近 1；被量化后分布变平、熵上升、top-1 概率下降。",
+    "logit 精度反推（ICLR Blogposts 2026）利用 log-softmax 只做整体平移这一性质："
+    "若原始 logits 是低精度存储的，必然存在唯一平移量使全部 logprob 在低精度格式里精确可表示。",
+    "tokenizer 指纹是抓「换模型」最硬的一条：同一个标称模型在不同供应商处，"
+    "固定字符串的 prompt_tokens 必须完全一致，对不上就说明底层实现不同。",
+    "所有这些都是「相对」判断：单次结果没有意义，必须固定模型 ID、参数、"
+    "提示词，多供应商同时跑，并且保存 baseline 以便日后复测漂移。",
+]
+
+
+def _sanitize(html: str, keep_svg_only: bool = False) -> str:
+    """报告里内联渲染模型输出前，先把脚本和事件属性去掉。"""
+    h = re.sub(r"<script[\s\S]*?</script>", "", html or "", flags=re.I)
+    h = re.sub(r"\son[a-z]+\s*=\s*(\"[^\"]*\"|'[^']*')", "", h, flags=re.I)
+    h = re.sub(r"javascript:", "", h, flags=re.I)
+    if keep_svg_only:
+        m = re.search(r"<svg[\s\S]*?</svg>", h, re.I)
+        h = m.group(0) if m else ""
+    return h
+
+
+def write_gallery(outdir: str, results: list, probes: list):
+    """生成 gallery.html：同一个探针下所有模型并排，直接看图比高低。"""
+    visual = [p for p in probes if p.kind in ("svg", "html")]
+    if not visual:
+        return
+    parts = ["<!DOCTYPE html><html lang=zh><head><meta charset=utf-8>",
+             "<title>modelcheck 视觉对比</title><style>",
+             "body{font:14px/1.5 -apple-system,'PingFang SC',sans-serif;margin:24px;background:#fafafa;color:#222}",
+             "h1{font-size:20px}h2{margin-top:32px;border-top:1px solid #ddd;padding-top:16px}",
+             ".row{display:flex;flex-wrap:wrap;gap:16px}",
+             ".card{background:#fff;border:1px solid #e3e3e3;border-radius:10px;padding:10px;width:340px}",
+             ".card h3{font-size:13px;margin:0 0 6px}",
+             ".box{background:#fff;border:1px dashed #ddd;border-radius:6px;height:230px;display:flex;"
+             "align-items:center;justify-content:center;overflow:hidden}",
+             ".box svg{max-width:100%;max-height:220px;height:auto}",
+             ".score{font-weight:700}.bad{color:#b00}.good{color:#080}",
+             ".det{color:#666;font-size:12px;margin-top:6px}",
+             "iframe{width:100%;height:230px;border:0;background:#fff}",
+             ".prompt{color:#555;font-size:12px;font-family:ui-monospace,monospace;background:#f2f2f2;padding:6px 8px;border-radius:6px}",
+             "</style></head><body>",
+             f"<h1>modelcheck 视觉对比 · {_dt.datetime.now():%Y-%m-%d %H:%M}</h1>",
+             "<p>下面是同一提示词下各模型的原始输出。自动分只是结构分的参考，"
+             "最终请自己看图：<b>鹈鹕是否真的骑在车上</b>、轮子是不是轮子、有没有环境与细节。</p>"]
+
+    for p in visual:
+        parts.append(f"<h2>{p.id}</h2>")
+        parts.append(f"<div class=prompt>{_esc(p.prompt[:300])}</div><div class=row>")
+        for res in results:
+            run = next((r for r in res["runs"] if r["probe_id"] == p.id), None)
+            if not run:
+                continue
+            name = res["target"].get("name", res["slug"])
+            sc = run["score"] * 100
+            cls = "good" if sc >= 75 else ("bad" if sc < 45 else "")
+            parts.append("<div class=card>")
+            parts.append(f"<h3>{_esc(name)}　<span class='score {cls}'>{sc:.0f}</span>/100</h3>")
+            if not run["ok"]:
+                parts.append(f"<div class=box style='color:#b00'>调用失败：{_esc(run.get('error','')[:120])}</div>")
+            elif p.kind == "svg":
+                svg = _sanitize(run.get("code") or run.get("text") or "", keep_svg_only=True)
+                parts.append(f"<div class=box>{svg or '<span style=color:#999>没有有效 SVG</span>'}</div>")
+            else:
+                html = _sanitize(run.get("code") or run.get("text") or "")
+                svg = _sanitize(html, keep_svg_only=True)
+                parts.append(f"<div class=box>{svg or '<span style=color:#999>没有有效 SVG</span>'}</div>")
+            parts.append(f"<div class=det>{_esc(run.get('detail') or run.get('error') or '')[:160]}</div>")
+            parts.append("</div>")
+        parts.append("</div>")
+    parts.append("</body></html>")
+    with open(os.path.join(outdir, "gallery.html"), "w", encoding="utf-8") as f:
+        f.write("\n".join(parts))
+
+
+def _esc(s: str) -> str:
+    return (str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+# --------------------------------------------------------------------------
+# 自检用的本地 mock 网关（不需要任何 API key，就能验证整条流水线）
+# --------------------------------------------------------------------------
+
+_GOOD_SVG = '''<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+  <circle cx="270" cy="210" r="45" fill="none" stroke="#333" stroke-width="4"/>
+  <circle cx="130" cy="210" r="45" fill="none" stroke="#333" stroke-width="4"/>
+  <line x1="130" y1="210" x2="270" y2="210" stroke="#333" stroke-width="4"/>
+  <line x1="200" y1="210" x2="200" y2="150" stroke="#333" stroke-width="4"/>
+  <line x1="200" y1="150" x2="270" y2="210" stroke="#333" stroke-width="4"/>
+  <line x1="200" y1="150" x2="165" y2="125" stroke="#333" stroke-width="4"/>
+  <ellipse cx="195" cy="115" rx="42" ry="30" fill="#f7f7f7"/>
+  <path d="M195 115 Q215 95 228 82" fill="none" stroke="#f7f7f7" stroke-width="12"/>
+  <circle cx="232" cy="76" r="14" fill="#f7f7f7"/>
+  <path d="M232 76 Q262 74 274 84 L232 92 Z" fill="orange"/>
+  <path d="M195 115 Q225 128 238 152" fill="none" stroke="#f7f7f7" stroke-width="10"/>
+  <line x1="185" y1="140" x2="200" y2="152" stroke="orange" stroke-width="4"/>
+  <line x1="207" y1="140" x2="200" y2="152" stroke="orange" stroke-width="4"/>
+  <circle cx="236" cy="72" r="2.5" fill="#111"/>
+</svg>'''
+
+_BAD_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect x="40" y="30" width="20" height="40" fill="black"/>
+  <circle cx="45" cy="70" r="4" fill="gray"/>
+  <circle cx="55" cy="70" r="4" fill="gray"/>
+  <text x="10" y="95">pelican on a bicycle</text>
+</svg>'''
+
+
+_HOUSE = '''<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+  <rect x="120" y="140" width="160" height="120" fill="#e8dcc8" stroke="#8a7a66" stroke-width="4"/>
+  <polygon points="120,140 200,80 280,140" fill="#b04a3a"/>
+  <rect x="178" y="192" width="48" height="68" fill="#7a5230"/>
+  <circle cx="214" cy="228" r="4" fill="#f0d060"/>
+  <rect x="138" y="164" width="36" height="36" fill="#a8d8f0" stroke="#8a7a66" stroke-width="3"/>
+  <rect x="226" y="164" width="36" height="36" fill="#a8d8f0" stroke="#8a7a66" stroke-width="3"/>
+  <line x1="156" y1="164" x2="156" y2="200" stroke="#8a7a66" stroke-width="3"/>
+  <line x1="138" y1="182" x2="174" y2="182" stroke="#8a7a66" stroke-width="3"/>
+  <line x1="244" y1="164" x2="244" y2="200" stroke="#8a7a66" stroke-width="3"/>
+  <line x1="226" y1="182" x2="262" y2="182" stroke="#8a7a66" stroke-width="3"/>
+</svg>'''
+
+# 这些提示词的「正确答案」，mock 网关据此模拟正常 / 退化的模型
+_MOCK_EXPECT = {
+    "2 + 2 =": "4",
+    "The capital of France is": "Paris",
+    "1, 2, 3, 4, 5,": "6",
+    "The opposite of hot is": "cold",
+    "The first letter of the alphabet is": "A",
+    "Roses are red, violets are": "blue",
+    "The sun rises in the": "east",
+    "7 times 8 equals": "56",
+    "The chemical symbol for gold is": "Au",
+    "Water is made of hydrogen and": "oxygen",
+    "The largest planet in our solar system is": "Jupiter",
+    "Python's file extension is dot": "py",
+}
+
+
+def _mock_top_logprobs(prec: str, seed: int = 3, n: int = 20) -> list:
+    """造一批「已知精度」的 logprob，用来验证精度反推。"""
+    rnd = random.Random(seed)
+    logits = [_nearest(rnd.uniform(-4, 26), prec) for _ in range(n)]
+    mx = max(logits)
+    lse = mx + math.log(sum(math.exp(v - mx) for v in logits))
+    lps = sorted({_f32(v - lse) for v in logits}, reverse=True)
+    return [{"token": f"tok{i}", "logprob": lp} for i, lp in enumerate(lps)]
+
+
+class _MockHandler(__import__("http.server", fromlist=["BaseHTTPRequestHandler"]).BaseHTTPRequestHandler):
+    quality = "good"
+    prec = "bf16"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        n = int(self.headers.get("content-length", 0) or 0)
+        try:
+            req = json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            req = {}
+        msgs = req.get("messages") or []
+        user = (msgs[-1].get("content") or "") if msgs else ""
+        system = " ".join(m.get("content", "") for m in msgs if m.get("role") == "system")
+        low = user.lower()
+        degraded = self.quality != "good"
+        text = "ok"
+        logprobs = None
+        finish = "stop"
+
+        if req.get("logprobs"):
+            lps = _mock_top_logprobs(self.prec)
+            tok = lps[0]["token"] if degraded else _MOCK_EXPECT.get(user.strip(), lps[0]["token"])
+            logprobs = {"content": [{"token": tok, "logprob": lps[0]["logprob"],
+                                     "top_logprobs": lps}]}
+            text = tok
+        elif "self-contained html" in low:
+            if degraded:
+                text = "<!DOCTYPE html>\n<html><body>\n" + _BAD_SVG + "\n</body></html>"
+            else:
+                text = ("<!DOCTYPE html>\n<html><head><meta charset='utf-8'><style>\n"
+                        "@keyframes spin{to{transform:rotate(360deg)}}\n"
+                        ".wheel{transform-box:fill-box;transform-origin:center;"
+                        "animation:spin 2s linear infinite}\n"
+                        "</style></head><body>\n"
+                        + _GOOD_SVG.replace('stroke="#333" stroke-width="4"',
+                                            'class="wheel" stroke="#333" stroke-width="4"')
+                        + "\n</body></html>")
+        elif "pelican" in low and "svg" in low:
+            text = "```svg\n" + (_BAD_SVG if degraded else _GOOD_SVG) + "\n```"
+        elif "capybara" in low:
+            text = "```svg\n" + (_BAD_SVG if degraded else _GOOD_SVG).replace("pelican", "capybara") + "\n```"
+        elif "house" in low:
+            text = "```svg\n" + _HOUSE + "\n```"
+        elif "4783 * 692" in low:
+            text = "3310636" if degraded else "3309836"
+        elif "17*23" in low:
+            text = "914"
+        elif "letter 'r'" in low:
+            text = "2, 3, 4" if degraded else "3, 3, 4"
+        elif "return only a json object" in low:
+            text = '{"name": "x", "age": 3, "tags": ["a","b"]}' if degraded else \
+                   '{"name": "x", "age": 3, "tags": ["a","b","c"]}'
+        elif "exactly 5 words" in low:
+            text = "I like yellow banana" if degraded else "please pass the ripe banana"
+        elif "integers from 1 to 200" in low:
+            text = "\n".join(str(i) for i in range(1, 201))
+            if degraded:
+                text = "\n".join(str(i) for i in range(1, 121))
+                finish = "length"
+        elif "\u91cf\u5316" in user:
+            if degraded:
+                text = "\u91cf\u5316\u5c31\u662f\u538b\u7f29\u3002"
+            else:
+                text = ("\u91cf\u5316\u662f\u6307\u628a\u795e\u7ecf\u7f51\u7edc\u91cc\u7684\u53c2\u6570"
+                        "\u4ece\u9ad8\u7cbe\u5ea6\u7684\u6d6e\u70b9\u6570\uff08\u4f8b\u5982 FP16\uff09"
+                        "\u8f6c\u6362\u6210\u4f4e\u4f4d\u6570\u7684\u6574\u6570\uff0c\u4ece\u800c\u5728"
+                        "\u727a\u7272\u4e00\u5b9a\u7cbe\u5ea6\u7684\u524d\u63d0\u4e0b\uff0c\u628a"
+                        "\u6a21\u578b\u7684\u663e\u5b58\u5360\u7528\u964d\u5230\u539f\u6765\u7684"
+                        "\u56db\u5206\u4e4b\u4e00\u751a\u81f3\u66f4\u4f4e\uff0c\u540c\u65f6\u63d0\u5347"
+                        "\u63a8\u7406\u901f\u5ea6\u3002\u5e38\u89c1\u7684\u505a\u6cd5\u5305\u62ec "
+                        "INT8 \u4e0e INT4\uff0c\u4ee5\u53ca\u8fd1\u5e74\u6d41\u884c\u7684 FP8\u3002"
+                        "\u9700\u8981\u6ce8\u610f\u7684\u662f\uff0c\u5e45\u5ea6\u8fc7\u5927\u7684"
+                        "\u91cf\u5316\u4f1a\u8ba9\u6a21\u578b\u5728\u6570\u503c\u63a8\u7406\u548c"
+                        "\u957f\u6587\u672c\u4efb\u52a1\u4e0a\u660e\u663e\u9000\u5316\u3002")
+        elif "\u5907\u7528\u94a5\u5319" in user:
+            text = "XZ-0000" if degraded else "XZ-4471"
+        elif "median" in low:
+            text = "def median(nums):\n    s = sorted(nums)\n    return s[len(s)//2]" if degraded else \
+                   "def median(nums):\n    s = sorted(nums)\n    n = len(s)\n    if n % 2:\n        return s[n//2]\n    return (s[n//2 - 1] + s[n//2]) / 2"
+        elif "which model" in low:
+            text = "I am a large language model." if degraded else "I am Claude 3.5 Sonnet."
+        elif system and "french" in system.lower():
+            text = "bleu" if not degraded else "The sky is blue"
+
+        body = {
+            "id": "mock", "object": "chat.completion", "model": req.get("model", "mock"),
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
+                         "finish_reason": finish, **(({"logprobs": logprobs}) if logprobs else {})}],
+            "usage": {"prompt_tokens": max(1, len(user) // 4) + (0 if not degraded else 1),
+                      "completion_tokens": max(1, len(text) // 4),
+                      "total_tokens": max(2, (len(user) + len(text)) // 4)},
+        }
+        raw = json.dumps(body).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+
+def start_mock_gateway(quality: str = "good", prec: str = "bf16"):
+    """起一个本地 OpenAI 兼容 mock 网关，返回 (base_url, shutdown_fn)。"""
+    import http.server
+    import threading
+
+    handler = type("H", (_MockHandler,), {"quality": quality, "prec": prec})
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return f"http://127.0.0.1:{srv.server_address[1]}/v1", srv.shutdown
+
+
+# --------------------------------------------------------------------------
+# 漂移基线：同一个端点，今天 vs 上次
+# --------------------------------------------------------------------------
+
+def baseline_snapshot(results: list) -> dict:
+    """把这次的关键指标存成基线，供日后复测比较。"""
+    snap = {"generated": _dt.datetime.now().isoformat(timespec="seconds"), "targets": {}}
+    for res in results:
+        lp = (res.get("fingerprint") or {}).get("logprob") or {}
+        snap["targets"][res["slug"]] = {
+            "model": res["target"].get("model", ""),
+            "tokenizer": ((res.get("fingerprint") or {}).get("tokenizer") or {}).get("fingerprint"),
+            "mean_top1_prob": lp.get("mean_top1_prob"),
+            "mean_entropy": lp.get("mean_entropy"),
+            "top1_agreement": lp.get("top1_agreement"),
+            "precision": (lp.get("precision") or {}).get("precision") if lp.get("ok") else None,
+            "per_prompt_logprob": {
+                p["prompt"]: p.get("top1_prob") for p in (lp.get("per_prompt") or [])
+            },
+        }
+    return snap
+
+
+def compare_baseline(results: list, baseline: dict, tol: float = 0.05) -> list:
+    """拿最新结果和基线比：tokenizer 变了 / 分布明显移动 = 端点后面被换过。
+
+    对应 arXiv:2512.03816（Log Probability Tracking of LLM APIs）的思路：
+    固定提示词，看首 token 的 logprob 是否发生系统性位移。
+    """
+    flags = []
+    for res in results:
+        old = (baseline.get("targets") or {}).get(res["slug"])
+        if not old:
+            flags.append({"slug": res["slug"], "sev": "info", "msg": "基线里没有这个端点，已新建"})
+            continue
+        new_tok = ((res.get("fingerprint") or {}).get("tokenizer") or {}).get("fingerprint")
+        if old.get("tokenizer") and new_tok and old["tokenizer"] != new_tok:
+            flags.append({"slug": res["slug"], "sev": "high",
+                          "msg": f"tokenizer 指纹变了：{old['tokenizer']} -> {new_tok}，端点后面的模型被换过"})
+        lp = (res.get("fingerprint") or {}).get("logprob") or {}
+        old_pp = old.get("per_prompt_logprob") or {}
+        moved = []
+        for p in (lp.get("per_prompt") or []):
+            o = old_pp.get(p["prompt"])
+            n = p.get("top1_prob")
+            if o is not None and n is not None and abs(n - o) > tol:
+                moved.append((p["prompt"], o, n))
+        if moved:
+            sev = "high" if len(moved) >= 3 else "warn"
+            flags.append({"slug": res["slug"], "sev": sev,
+                          "msg": f"{len(moved)} 个提示词的首 token logprob 离开基线超过 {tol}，"
+                                 f"例如 {moved[0][0]!r}: {moved[0][1]:.3f} -> {moved[0][2]:.3f}"})
+        if not any(f["slug"] == res["slug"] for f in flags):
+            flags.append({"slug": res["slug"], "sev": "info", "msg": "与基线一致，未检出漂移"})
+    return flags
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def load_targets(path: str) -> list:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    items = data.get("targets", data) if isinstance(data, dict) else data
+    out = []
+    for it in items:
+        key = it.get("api_key", "")
+        if isinstance(key, str) and key.startswith("env:"):
+            key = os.environ.get(key[4:], "")
+        out.append(Target(name=it["name"], base_url=it["base_url"], api_key=key or "",
+                          model=it.get("model", ""), note=it.get("note", ""),
+                          extra_body=it.get("extra_body") or {},
+                          headers=it.get("headers") or {}))
+    return out
+
+
+def selftest() -> int:
+    """不需要任何 API key 的自检：打分器、精度反推、检查器、端到端流水线。"""
+    ok = True
+    print("=" * 68)
+    print("modelcheck 自检")
+    print("=" * 68)
+
+    # 1) SVG 打分器：官方样例里「好」的必须明显高于「差」的
+    fx = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+    scores = {}
+    if os.path.isdir(fx):
+        for fn in sorted(os.listdir(fx)):
+            if fn.endswith(".svg"):
+                with open(os.path.join(fx, fn), encoding="utf-8") as f:
+                    scores[fn] = score_svg(analyze_svg(f.read()))["score"]
+    if scores:
+        best = max(scores, key=scores.get)
+        worst = min(scores, key=scores.get)
+        print(f"\n[1] SVG 打分器（{len(scores)} 个官方样例）")
+        for k, v in sorted(scores.items(), key=lambda kv: -kv[1]):
+            print(f"    {v*100:5.1f}  {k}")
+        good = scores.get("claude-3-5-sonnet-20241022.svg", 0)
+        bad = scores.get("gpt-3.5-turbo.svg", 0)
+        passed = good - bad >= 0.15
+        ok &= passed
+        print(f"    区分度检查：{best} {scores[best]*100:.0f} vs {worst} {scores[worst]*100:.0f} "
+              f"-> {'通过' if passed else '失败'}")
+
+    # 2) logit 精度反推
+    print("\n[2] logit 精度反推")
+    good = 0
+    for fmt in ["fp8_e5m2", "fp8_e4m3", "bf16", "fp16", "fp32"]:
+        rnd = random.Random(5)
+        logits = [_nearest(rnd.uniform(-5, 25), fmt) for _ in range(20)]
+        mx = max(logits)
+        lse = mx + math.log(sum(math.exp(v - mx) for v in logits))
+        vals = sorted({_f32(v - lse) for v in logits}, reverse=True)
+        got = infer_logit_precision(vals).get("precision")
+        hit = got == fmt
+        good += hit
+        print(f"    真值 {fmt:10s} -> 判定 {got:10s} {'✓' if hit else '✗'}")
+    fp_count = 0
+    for seed in range(30):
+        rnd = random.Random(900 + seed)
+        logits = [rnd.uniform(-8, 30) for _ in range(20)]
+        mx = max(logits)
+        lse = mx + math.log(sum(math.exp(v - mx) for v in logits))
+        vals = sorted({_f32(v - lse) for v in logits}, reverse=True)
+        if infer_logit_precision(vals).get("precision") != "fp32":
+            fp_count += 1
+    passed = good == 5 and fp_count == 0
+    ok &= passed
+    print(f"    命中 {good}/5，fp32 误报 {fp_count}/30 -> {'通过' if passed else '失败'}")
+
+    # 3) 检查器
+    print("\n[3] 确定性检查器")
+    R = CallResult(ok=True, text="3309836", finish_reason="stop")
+    cases = [
+        ("exact", "3309836", {"expect": "3309836"}, 1.0),
+        ("exact", "3309835", {"expect": "3309836"}, 0.0),
+        ("letters", "3, 3, 4", {"expect": [3, 3, 4]}, 1.0),
+        ("json", '{"name":"x","age":3,"tags":["a","b","c"]}',
+         {"schema": {"name": "str", "age": "int", "tags": "array"}, "array_len": 3}, 1.0),
+        ("words", "please pass the ripe banana",
+         {"n_words": 5, "last_word": "banana", "lowercase": True, "no_punct": True}, 1.0),
+        ("needle", "XZ-4471", {"needle": "XZ-4471"}, 1.0),
+    ]
+    cok = True
+    for name, text, params, want in cases:
+        got, _ = CHECKERS[name](text, params, CallResult(ok=True, text=text))
+        hit = abs(got - want) < 1e-6
+        cok &= hit
+        print(f"    {name:8s} 期望 {want:4.1f} 得到 {got:4.1f} {'✓' if hit else '✗'}")
+    code = ("def median(nums):\n    s = sorted(nums)\n    n = len(s)\n"
+            "    if n % 2: return s[n//2]\n    return (s[n//2-1]+s[n//2])/2")
+    got, det = CHECKERS["python"](code, {"tests": "assert median([1,2,3,4])==2.5\nprint('ok')\n"},
+                                  CallResult(ok=True, text=code))
+    print(f"    python   期望 1.0 得到 {got:4.1f} ({det}) {'✓' if got == 1.0 else '✗'}")
+    ok &= cok and got == 1.0
+
+    # 4) 端到端：两个 mock 网关，一个正常一个「被量化」
+    print("\n[4] 端到端流水线（本地 mock 网关，无需 API key）")
+    url_good, stop_g = start_mock_gateway("good", "bf16")
+    url_bad, stop_b = start_mock_gateway("degraded", "fp8_e4m3")
+    try:
+        targets = [Target("mock-good", url_good, "k", "mock-llm-1"),
+                   Target("mock-degraded", url_bad, "k", "mock-llm-2")]
+        probes = build_probes()
+        outdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "selftest-run")
+        results = [run_target(t, probes, outdir, jobs=4) for t in targets]
+        rep = write_report(outdir, results, probes)
+        rows = {r["slug"]: r for r in rep["rows"]}
+        g, b = rows["mock-good"], rows["mock-degraded"]
+        print(f"    mock-good     visual={g['visual']} capability={g['capability']} "
+              f"precision={g['precision']} agree={g['top1_agreement']}")
+        print(f"    mock-degraded visual={b['visual']} capability={b['capability']} "
+              f"precision={b['precision']} agree={b['top1_agreement']}")
+        checks = [
+            ("正常端点的视觉分 > 90%", (g["visual"] or 0) > 0.9),
+            ("被量化端点的视觉分明显更低", (g["visual"] or 0) - (b["visual"] or 0) > 0.2),
+            ("被量化端点的能力分明显更低", (g["capability"] or 0) - (b["capability"] or 0) > 0.15),
+            ("正常端点识别为 bf16", g["precision"] == "bf16"),
+            ("被量化端点识别为更低精度", _MANTISSA_BITS.get(b["precision"], 99) < _MANTISSA_BITS.get(g["precision"], 0)),
+            ("被量化端点被标出可疑", any(f["sev"] in ("high", "warn") for f in b["flags"])),
+            ("生成了 gallery.html", os.path.exists(os.path.join(outdir, "gallery.html"))),
+        ]
+        for label, hit in checks:
+            ok &= hit
+            print(f"    {'✓' if hit else '✗'} {label}")
+        print(f"\n    报告：{rep['md']}")
+        print(f"    图表：{os.path.join(outdir, 'gallery.html')}")
+    finally:
+        stop_g(); stop_b()
+
+    print("\n" + "=" * 68)
+    print("自检结果：" + ("全部通过 ✅" if ok else "存在失败 ❌"))
+    print("=" * 68)
+    return 0 if ok else 1
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="modelcheck",
+        description="模型成色体检：视觉探针 + 确定性探针 + logprob/量化指纹",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--targets", help="端点配置文件（见 targets.example.json）")
+    ap.add_argument("--out", default="runs/latest", help="输出目录")
+    ap.add_argument("--only", default="", help="只跑某些探针/分组，逗号分隔（visual,capability 或具体 id）")
+    ap.add_argument("--jobs", type=int, default=1, help="并发数（同一端点内并行跑探针）")
+    ap.add_argument("--no-exec", action="store_true", help="禁止执行模型生成的代码（默认会跑）")
+    ap.add_argument("--no-fingerprint", action="store_true", help="跳过 L3 指纹（省请求）")
+    ap.add_argument("--baseline", help="已有基线 JSON，用于检测端点漂移")
+    ap.add_argument("--save-baseline", help="把本次关键指标存成基线 JSON")
+    ap.add_argument("--selftest", action="store_true", help="不需要 API key 的自检")
+    ap.add_argument("--list-probes", action="store_true", help="列出所有探针")
+    args = ap.parse_args(argv)
+
+    if args.selftest:
+        return selftest()
+
+    probes = build_probes()
+    if args.list_probes:
+        for p in probes:
+            print(f"{p.group:12s} {p.id:20s} {p.desc}")
+        print(f"{'fingerprint':12s} {'logprob_battery':20s} 量化检测：分布糊度 + logit 精度反推")
+        print(f"{'fingerprint':12s} {'tokenizer_fp':20s} 换模型检测：固定字符串的 prompt_tokens")
+        print(f"{'fingerprint':12s} {'protocol':20s} system 遵循 / model 回显 / 温度 0 确定性")
+        return 0
+
+    if not args.targets:
+        ap.error("需要 --targets（或用 --selftest / --list-probes）")
+    targets = load_targets(args.targets)
+
+    if args.only:
+        want = {x.strip() for x in args.only.split(",") if x.strip()}
+        probes = [p for p in probes if p.id in want or p.group in want]
+        if not probes:
+            ap.error(f"--only={args.only} 没有匹配到任何探针")
+
+    def log(msg):
+        print(msg, flush=True)
+
+    log(f"modelcheck v{__version__}　端点 {len(targets)} 个　探针 {len(probes)} 个")
+    results = []
+    for t in targets:
+        try:
+            results.append(run_target(t, probes, args.out, exec_code=not args.no_exec,
+                                      jobs=max(1, args.jobs),
+                                      do_fingerprint=not args.no_fingerprint, log=log))
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            log(f"  [{t.name}] 失败：{type(e).__name__}: {e}")
+
+    if not results:
+        log("没有任何端点成功完成")
+        return 1
+
+    rep = write_report(args.out, results, probes)
+    rows = rep["rows"]
+
+    print()
+    print(f"{'模型':<24} {'L1视觉':>7} {'L2能力':>7} {'logit精度':>12} {'答对率':>7}  判定")
+    print("-" * 78)
+    for r in sorted(rows, key=lambda x: -(x["visual"] or 0)):
+        print(f"{r['name'][:24]:<24} {_fmt_pct(r['visual']):>7} {_fmt_pct(r['capability']):>7} "
+              f"{(r['precision'] or '不支持'):>12} {_fmt_pct(r['top1_agreement']):>7}  {verdict_line(r)}")
+    print()
+    for r in rows:
+        for fl in r["flags"]:
+            mark = {"high": "⛔", "warn": "⚠️", "info": "ℹ️"}[fl["sev"]]
+            print(f"{mark} {r['name']}：{fl['msg']}")
+
+    if args.baseline:
+        with open(args.baseline, encoding="utf-8") as f:
+            try:
+                base = json.load(f)
+            except Exception:
+                base = {}
+        print("\n漂移对比（vs 基线）：")
+        for fl in compare_baseline(results, base):
+            mark = {"high": "⛔", "warn": "⚠️", "info": "ℹ️"}[fl["sev"]]
+            print(f"{mark} {fl['slug']}：{fl['msg']}")
+
+    if args.save_baseline:
+        with open(args.save_baseline, "w", encoding="utf-8") as f:
+            json.dump(baseline_snapshot(results), f, ensure_ascii=False, indent=2)
+        print(f"\n基线已保存：{args.save_baseline}")
+
+    print(f"\n报告：{rep['md']}")
+    print(f"图表：{os.path.join(args.out, 'gallery.html')}")
+    print(f"原始：{os.path.join(args.out, 'report.json')}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
